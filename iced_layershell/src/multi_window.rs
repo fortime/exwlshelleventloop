@@ -589,63 +589,64 @@ async fn run_instance<A, E, C>(
                 },
             ) => {
                 let mut is_new_window = false;
-                let (id, window) = if let Some((id, window)) = window_manager.get_mut_alias(wrapper.id()) {
-                    let logical_size = window.state.logical_size();
+                let (id, window) =
+                    if let Some((id, window)) = window_manager.get_mut_alias(wrapper.id()) {
+                        let logical_size = window.state.logical_size();
 
-                    if logical_size.width != width as f32
-                        || logical_size.height != height as f32
-                        || window.state.scale_factor() != fractal_scale
-                    {
-                        let ui = user_interfaces.remove(&id).expect("Get User interface");
-                        window.state.update_view_port(width, height, fractal_scale);
+                        if logical_size.width != width as f32
+                            || logical_size.height != height as f32
+                            || window.state.scale_factor() != fractal_scale
+                        {
+                            let ui = user_interfaces.remove(&id).expect("Get User interface");
+                            window.state.update_view_port(width, height, fractal_scale);
+
+                            let _ = user_interfaces.insert(
+                                id,
+                                ui.relayout(window.state.logical_size(), &mut window.renderer),
+                            );
+                        }
+                        (id, window)
+                    } else {
+                        let wrapper = Arc::new(wrapper);
+                        is_new_window = true;
+                        let id = info.unwrap_or_else(window::Id::unique);
+                        if compositor.is_none() {
+                            replace_compositor!(wrapper);
+                            clipboard = LayerShellClipboard::connect(&wrapper);
+                        }
+
+                        let window = window_manager.insert(
+                            id,
+                            (width, height),
+                            fractal_scale,
+                            wrapper,
+                            &application,
+                            compositor.as_mut().expect("It should have been created"),
+                        );
+                        let logical_size = window.state.logical_size();
 
                         let _ = user_interfaces.insert(
                             id,
-                            ui.relayout(window.state.logical_size(), &mut window.renderer),
+                            build_user_interface(
+                                &application,
+                                user_interface::Cache::default(),
+                                &mut window.renderer,
+                                logical_size,
+                                &mut debug,
+                                id,
+                            ),
                         );
-                    }
-                    (id, window)
-                } else {
-                    let wrapper = Arc::new(wrapper);
-                    is_new_window = true;
-                    let id = info.unwrap_or_else(window::Id::unique);
-                    if compositor.is_none() {
-                        replace_compositor!(wrapper);
-                        clipboard = LayerShellClipboard::connect(&wrapper);
-                    }
+                        let _ = ui_caches.insert(id, user_interface::Cache::default());
 
-                    let window = window_manager.insert(
-                        id,
-                        (width, height),
-                        fractal_scale,
-                        wrapper,
-                        &application,
-                        compositor.as_mut().expect("It should have been created"),
-                    );
-                    let logical_size = window.state.logical_size();
-
-                    let _ = user_interfaces.insert(
-                        id,
-                        build_user_interface(
-                            &application,
-                            user_interface::Cache::default(),
-                            &mut window.renderer,
-                            logical_size,
-                            &mut debug,
-                            id,
-                        ),
-                    );
-                    let _ = ui_caches.insert(id, user_interface::Cache::default());
-
-                    events.push((
-                        Some(id),
-                        Event::Window(window::Event::Opened {
-                            position: None,
-                            size: window.state.logical_size(),
-                        }),
-                    ));
-                    (id, window)
-                };
+                        events.push((
+                            Some(id),
+                            Event::Window(window::Event::Opened {
+                                position: None,
+                                size: window.state.logical_size(),
+                            }),
+                        ));
+                        (id, window)
+                    };
                 let compositor = compositor
                     .as_mut()
                     .expect("The compositor should have been created");
