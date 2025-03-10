@@ -557,7 +557,7 @@ async fn run_instance<A, E, C>(
     // record the last window id, when window is removed, we compare the id with the last id, to
     // find out if the current surface binding with the compositor is dead, if so, update the
     // compositor with the alive one
-    let mut last_id = None;
+    // let mut last_id = None;
     // mark if compositor needs to be updated
     let mut compositor_to_be_updated = true;
 
@@ -604,7 +604,7 @@ async fn run_instance<A, E, C>(
                         replace_compositor!(wrapper);
                         clipboard = LayerShellClipboard::connect(&wrapper);
                         compositor_to_be_updated = false;
-                        last_id = Some(id);
+                        //last_id = Some(id);
                     }
 
                     let window = window_manager.insert(
@@ -661,7 +661,7 @@ async fn run_instance<A, E, C>(
                         let wrapper = Arc::new(wrapper);
                         replace_compositor!(wrapper);
                         clipboard = LayerShellClipboard::connect(&wrapper);
-                        last_id = Some(id);
+                        //last_id = Some(id);
                         compositor_to_be_updated = false;
                     }
                     (id, window)
@@ -934,12 +934,12 @@ async fn run_instance<A, E, C>(
 
                 // NOTE: if current binding surface is still alive, we do not need to update the
                 // compositor
-                if let Some(last_id) = last_id {
-                    if last_id != id {
-                        continue;
-                    }
-                }
-                compositor_to_be_updated = true;
+                //if let Some(last_id) = last_id {
+                //    if last_id != id {
+                //        continue;
+                //    }
+                //}
+                //compositor_to_be_updated = true;
             }
             MultiWindowIcedLayerEvent(
                 Some(id),
