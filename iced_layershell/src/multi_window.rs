@@ -710,7 +710,7 @@ async fn run_instance<A, E, C>(
                 debug.draw_started();
                 ui.draw(
                     &mut window.renderer,
-                    &application.theme(id),
+                    window.state.theme(),
                     &iced_core::renderer::Style {
                         text_color: window.state.text_color(),
                     },
