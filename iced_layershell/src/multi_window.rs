@@ -589,7 +589,23 @@ async fn run_instance<A, E, C>(
                 },
             ) => {
                 let mut is_new_window = false;
-                let (id, window) = if window_manager.get_mut_alias(wrapper.id()).is_none() {
+                let (id, window) = if let Some((id, window)) = window_manager.get_mut_alias(wrapper.id()) {
+                    let logical_size = window.state.logical_size();
+
+                    if logical_size.width != width as f32
+                        || logical_size.height != height as f32
+                        || window.state.scale_factor() != fractal_scale
+                    {
+                        let ui = user_interfaces.remove(&id).expect("Get User interface");
+                        window.state.update_view_port(width, height, fractal_scale);
+
+                        let _ = user_interfaces.insert(
+                            id,
+                            ui.relayout(window.state.logical_size(), &mut window.renderer),
+                        );
+                    }
+                    (id, window)
+                } else {
                     let wrapper = Arc::new(wrapper);
                     is_new_window = true;
                     let id = info.unwrap_or_else(window::Id::unique);
@@ -628,24 +644,6 @@ async fn run_instance<A, E, C>(
                             size: window.state.logical_size(),
                         }),
                     ));
-                    (id, window)
-                } else {
-                    let (id, window) = window_manager.get_mut_alias(wrapper.id()).unwrap();
-
-                    let logical_size = window.state.logical_size();
-
-                    if logical_size.width != width as f32
-                        || logical_size.height != height as f32
-                        || window.state.scale_factor() != fractal_scale
-                    {
-                        let ui = user_interfaces.remove(&id).expect("Get User interface");
-                        window.state.update_view_port(width, height, fractal_scale);
-
-                        let _ = user_interfaces.insert(
-                            id,
-                            ui.relayout(window.state.logical_size(), &mut window.renderer),
-                        );
-                    }
                     (id, window)
                 };
                 let compositor = compositor
