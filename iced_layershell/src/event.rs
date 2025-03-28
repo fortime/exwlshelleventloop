@@ -103,6 +103,7 @@ pub enum IcedLayerEvent<Message: 'static> {
         fractal_scale: f64,
         wrapper: WindowWrapper,
         info: Option<iced_core::window::Id>,
+        is_actived: bool,
     },
     RequestRefresh {
         width: u32,

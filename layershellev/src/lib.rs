@@ -66,11 +66,10 @@
 //!             }
 //!             LayerEvent::RequestMessages(DispatchMessage::MouseButton { .. }) => ReturnData::None,
 //!             LayerEvent::RequestMessages(DispatchMessage::MouseEnter {
-//!                 serial, pointer, ..
+//!                 pointer, ..
 //!             }) => ReturnData::RequestSetCursorShape((
 //!                 "crosshair".to_owned(),
 //!                 pointer.clone(),
-//!                 *serial,
 //!             )),
 //!             LayerEvent::RequestMessages(DispatchMessage::MouseMotion {
 //!                 time,
@@ -1400,17 +1399,23 @@ impl<T> Dispatch<wl_touch::WlTouch, ()> for WindowState<T> {
                 y,
             } => {
                 state.finger_locations.insert(id, (x, y));
-                state.update_current_surface(&surface, true);
-                state.message.push((
-                    state.surface_id(),
-                    DispatchMessageInner::TouchDown {
-                        serial,
-                        time,
-                        id,
-                        x,
-                        y,
-                    },
-                ))
+                // skip events from surface which is not actived.
+                let same_surface = Some(&surface) == state.current_surface.as_ref();
+                let updated = state.update_current_surface(&surface, true);
+                if same_surface || updated {
+                    state.message.push((
+                        state.surface_id(),
+                        DispatchMessageInner::TouchDown {
+                            serial,
+                            time,
+                            id,
+                            x,
+                            y,
+                        },
+                    ))
+                } else {
+                    state.finger_locations.remove(&id);
+                }
             }
             wl_touch::Event::Cancel => {
                 // get surface id before removed.
@@ -1424,27 +1429,27 @@ impl<T> Dispatch<wl_touch::WlTouch, ()> for WindowState<T> {
             wl_touch::Event::Up { serial, time, id } => {
                 // get surface id before removed.
                 let surface_id = state.surface_id();
-                let (x, y) = state.finger_locations.remove(&id).unwrap_or_else(|| {
-                    log::warn!("unable to find the last location of finger[{}]", id);
-                    (0., 0.)
-                });
-                state.message.push((
-                    surface_id,
-                    DispatchMessageInner::TouchUp {
-                        serial,
-                        time,
-                        id,
-                        x,
-                        y,
-                    },
-                ));
+                if let Some((x, y)) = state.finger_locations.remove(&id) {
+                    state.message.push((
+                        surface_id,
+                        DispatchMessageInner::TouchUp {
+                            serial,
+                            time,
+                            id,
+                            x,
+                            y,
+                        },
+                    ));
+                }
             }
             wl_touch::Event::Motion { time, id, x, y } => {
-                state.finger_locations.insert(id, (x, y));
-                state.message.push((
-                    state.surface_id(),
-                    DispatchMessageInner::TouchMotion { time, id, x, y },
-                ));
+                if state.finger_locations.contains_key(&id) {
+                    state.finger_locations.insert(id, (x, y));
+                    state.message.push((
+                        state.surface_id(),
+                        DispatchMessageInner::TouchMotion { time, id, x, y },
+                    ));
+                }
             }
             _ => {}
         }
@@ -1592,6 +1597,7 @@ impl<T> Dispatch<wl_pointer::WlPointer, ()> for WindowState<T> {
                 ));
             }
             wl_pointer::Event::Leave { .. } => {
+                log::error!("TODO, Leave");
                 state.pointer_enter_state = None;
                 state
                     .message
@@ -1603,8 +1609,13 @@ impl<T> Dispatch<wl_pointer::WlPointer, ()> for WindowState<T> {
                 surface_x,
                 surface_y,
             } => {
+                log::error!("TODO, Enter");
+                // If the cursor leaves a surface and enters the same surface again, current_surface won't be updated. So we check this condition.
+                let mut updated = state.pointer_enter_state.is_none()
+                    && Some(&surface) == state.current_surface.as_ref();
+                updated = state.update_current_surface(&surface, false) || updated;
                 state.pointer_enter_state = Some((serial, surface.clone()));
-                if state.update_current_surface(&surface, false) {
+                if updated {
                     // send enter event only if current_surface is updated, otherwise, the cursor
                     // is not entering current_surface.
                     state.message.push((
@@ -1627,6 +1638,10 @@ impl<T> Dispatch<wl_pointer::WlPointer, ()> for WindowState<T> {
                 if let Some((serial, surface)) = &pointer_enter_state {
                     if state.update_current_surface(surface, false) {
                         // send enter event because current_surface is changed.
+
+                        // In kwin_wayland, this case won't happen. Leave and Enter event won't be
+                        // sent, while a mouse button is pressing or a finger is down.
+                        // I'm not sure if this depends on server side implementation.
                         state.message.push((
                             state.surface_id(),
                             DispatchMessageInner::MouseEnter {
@@ -2353,34 +2368,22 @@ impl<T: 'static> WindowState<T> {
                             ReturnData::RequestExit => {
                                 break 'out;
                             }
-                            ReturnData::RequestSetCursorShape((shape_name, pointer, serial)) => {
-                                if let Some(ref cursor_manager) = cursor_manager {
-                                    let Some(shape) = str_to_shape(&shape_name) else {
-                                        log::error!("Not supported shape");
-                                        continue;
-                                    };
-                                    let device = cursor_manager.get_pointer(&pointer, &qh, ());
-                                    device.set_shape(serial, shape);
-                                    device.destroy();
-                                } else {
-                                    let Some(cursor_buffer) =
-                                        get_cursor_buffer(&shape_name, &connection, &shm)
-                                    else {
-                                        log::error!("Cannot find cursor {shape_name}");
-                                        continue;
-                                    };
-                                    let cursor_surface = wmcompositer.create_surface(&qh, ());
-                                    cursor_surface.attach(Some(&cursor_buffer), 0, 0);
-                                    // and create a surface. if two or more,
-                                    let (hotspot_x, hotspot_y) = cursor_buffer.hotspot();
-                                    pointer.set_cursor(
-                                        serial,
-                                        Some(&cursor_surface),
-                                        hotspot_x as i32,
-                                        hotspot_y as i32,
-                                    );
-                                    cursor_surface.commit();
-                                }
+                            ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                                let Some(serial) =
+                                    self.pointer_enter_state.as_ref().map(|(serial, _)| *serial)
+                                else {
+                                    continue;
+                                };
+                                set_cursor_shape(
+                                    cursor_manager.as_ref(),
+                                    &qh,
+                                    &connection,
+                                    &shm,
+                                    &wmcompositer,
+                                    shape_name,
+                                    pointer,
+                                    serial,
+                                );
                             }
                             _ => {}
                         }
@@ -2397,34 +2400,22 @@ impl<T: 'static> WindowState<T> {
                     ReturnData::RequestExit => {
                         break 'out;
                     }
-                    ReturnData::RequestSetCursorShape((shape_name, pointer, serial)) => {
-                        if let Some(ref cursor_manager) = cursor_manager {
-                            let Some(shape) = str_to_shape(&shape_name) else {
-                                log::error!("Not supported shape");
-                                continue;
-                            };
-                            let device = cursor_manager.get_pointer(&pointer, &qh, ());
-                            device.set_shape(serial, shape);
-                            device.destroy();
-                        } else {
-                            let Some(cursor_buffer) =
-                                get_cursor_buffer(&shape_name, &connection, &shm)
-                            else {
-                                log::error!("Cannot find cursor {shape_name}");
-                                continue;
-                            };
-                            let cursor_surface = wmcompositer.create_surface(&qh, ());
-                            cursor_surface.attach(Some(&cursor_buffer), 0, 0);
-                            // and create a surface. if two or more,
-                            let (hotspot_x, hotspot_y) = cursor_buffer.hotspot();
-                            pointer.set_cursor(
-                                serial,
-                                Some(&cursor_surface),
-                                hotspot_x as i32,
-                                hotspot_y as i32,
-                            );
-                            cursor_surface.commit();
-                        }
+                    ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                        let Some(serial) =
+                            self.pointer_enter_state.as_ref().map(|(serial, _)| *serial)
+                        else {
+                            continue;
+                        };
+                        set_cursor_shape(
+                            cursor_manager.as_ref(),
+                            &qh,
+                            &connection,
+                            &shm,
+                            &wmcompositer,
+                            shape_name,
+                            pointer,
+                            serial,
+                        );
                     }
                     _ => {}
                 }
@@ -2475,34 +2466,22 @@ impl<T: 'static> WindowState<T> {
                         ReturnData::RequestExit => {
                             break 'out;
                         }
-                        ReturnData::RequestSetCursorShape((shape_name, pointer, serial)) => {
-                            if let Some(ref cursor_manager) = cursor_manager {
-                                let Some(shape) = str_to_shape(&shape_name) else {
-                                    log::error!("Not supported shape");
-                                    continue;
-                                };
-                                let device = cursor_manager.get_pointer(&pointer, &qh, ());
-                                device.set_shape(serial, shape);
-                                device.destroy();
-                            } else {
-                                let Some(cursor_buffer) =
-                                    get_cursor_buffer(&shape_name, &connection, &shm)
-                                else {
-                                    log::error!("Cannot find cursor {shape_name}");
-                                    continue;
-                                };
-                                let cursor_surface = wmcompositer.create_surface(&qh, ());
-                                cursor_surface.attach(Some(&cursor_buffer), 0, 0);
-                                // and create a surface. if two or more,
-                                let (hotspot_x, hotspot_y) = cursor_buffer.hotspot();
-                                pointer.set_cursor(
-                                    serial,
-                                    Some(&cursor_surface),
-                                    hotspot_x as i32,
-                                    hotspot_y as i32,
-                                );
-                                cursor_surface.commit();
-                            }
+                        ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
+                            let Some(serial) =
+                                self.pointer_enter_state.as_ref().map(|(serial, _)| *serial)
+                            else {
+                                continue;
+                            };
+                            set_cursor_shape(
+                                cursor_manager.as_ref(),
+                                &qh,
+                                &connection,
+                                &shm,
+                                &wmcompositer,
+                                shape_name,
+                                pointer,
+                                serial,
+                            );
                         }
                         ReturnData::NewLayerShell((
                             NewLayerShellSettings {
@@ -2683,4 +2662,41 @@ fn get_cursor_buffer(
     let mut cursor_theme = CursorTheme::load(connection, shm.clone(), 23).ok()?;
     let cursor = cursor_theme.get_cursor(shape);
     Some(cursor?[0].clone())
+}
+
+fn set_cursor_shape<T: 'static>(
+    cursor_manager: Option<&WpCursorShapeManagerV1>,
+    qh: &QueueHandle<WindowState<T>>,
+    connection: &Connection,
+    shm: &WlShm,
+    wmcompositer: &WlCompositor,
+    shape_name: String,
+    pointer: WlPointer,
+    serial: u32,
+) {
+    if let Some(ref cursor_manager) = cursor_manager {
+        let Some(shape) = str_to_shape(&shape_name) else {
+            log::error!("Not supported shape");
+            return;
+        };
+        let device = cursor_manager.get_pointer(&pointer, qh, ());
+        device.set_shape(serial, shape);
+        device.destroy();
+    } else {
+        let Some(cursor_buffer) = get_cursor_buffer(&shape_name, connection, shm) else {
+            log::error!("Cannot find cursor {shape_name}");
+            return;
+        };
+        let cursor_surface = wmcompositer.create_surface(qh, ());
+        cursor_surface.attach(Some(&cursor_buffer), 0, 0);
+        // and create a surface. if two or more,
+        let (hotspot_x, hotspot_y) = cursor_buffer.hotspot();
+        pointer.set_cursor(
+            serial,
+            Some(&cursor_surface),
+            hotspot_x as i32,
+            hotspot_y as i32,
+        );
+        cursor_surface.commit();
+    }
 }
