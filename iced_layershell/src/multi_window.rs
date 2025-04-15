@@ -244,32 +244,29 @@ where
                 }
             }
             LayerEvent::RequestMessages(message) => 'outside: {
-                match message {
-                    DispatchMessage::RequestRefresh {
-                        width,
-                        height,
-                        scale_float,
-                        ..
-                    } => {
-                        let Some(unit) = ev.get_mut_unit_with_id(sended_id.unwrap()) else {
-                            break 'outside;
-                        };
-                        event_sender
-                            .start_send(MultiWindowIcedLayerEvent(
-                                sended_id,
-                                IcedLayerEvent::RequestRefreshWithWrapper {
-                                    width: *width,
-                                    height: *height,
-                                    fractal_scale: *scale_float,
-                                    wrapper: unit.gen_wrapper(),
-                                    info: unit.get_binding().cloned(),
-                                    is_actived: sended_id == ev.current_surface_id(),
-                                },
-                            ))
-                            .expect("Cannot send");
+                if let DispatchMessage::RequestRefresh {
+                    width,
+                    height,
+                    scale_float,
+                    ..
+                } = message {
+                    let Some(unit) = ev.get_mut_unit_with_id(sended_id.unwrap()) else {
                         break 'outside;
-                    }
-                    _ => {}
+                    };
+                    event_sender
+                        .start_send(MultiWindowIcedLayerEvent(
+                            sended_id,
+                            IcedLayerEvent::RequestRefreshWithWrapper {
+                                width: *width,
+                                height: *height,
+                                fractal_scale: *scale_float,
+                                wrapper: unit.gen_wrapper(),
+                                info: unit.get_binding().cloned(),
+                                is_mouse_surface: sended_id.map(|id| ev.is_mouse_surface(id)).unwrap_or(false),
+                            },
+                        ))
+                        .expect("Cannot send");
+                    break 'outside;
                 }
 
                 event_sender
@@ -581,7 +578,7 @@ async fn run_instance<A, E, C>(
                     fractal_scale,
                     wrapper,
                     info,
-                    is_actived,
+                    is_mouse_surface,
                 },
             ) => {
                 let mut is_new_window = false;
@@ -654,7 +651,7 @@ async fn run_instance<A, E, C>(
                 let redraw_event =
                     iced_core::Event::Window(window::Event::RedrawRequested(Instant::now()));
 
-                let cursor = if is_actived {
+                let cursor = if is_mouse_surface {
                     window.state.cursor()
                 } else {
                     Cursor::Unavailable
