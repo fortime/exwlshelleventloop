@@ -6,6 +6,7 @@ mod daemon;
 use std::borrow::Cow;
 
 use iced::{Font, Pixels};
+use layershellev::WithConnection;
 
 use crate::settings::{LayerShellSettings, VirtualKeyboardSettings};
 
@@ -52,6 +53,8 @@ pub struct MainSettings {
     pub antialiasing: bool,
 
     pub virtual_keyboard_support: Option<VirtualKeyboardSettings>,
+
+    pub with_connection: Option<WithConnection>,
 }
 impl Default for MainSettings {
     fn default() -> Self {
@@ -63,6 +66,7 @@ impl Default for MainSettings {
             default_text_size: Pixels(16.0),
             antialiasing: false,
             virtual_keyboard_support: None,
+            with_connection: None,
         }
     }
 }

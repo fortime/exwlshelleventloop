@@ -201,6 +201,9 @@ use calloop::{
 };
 use calloop_wayland_source::WaylandSource;
 use std::collections::HashMap;
+use std::fmt::Debug;
+use std::fmt::Formatter;
+use std::fmt::Result as FmtResult;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -579,6 +582,24 @@ impl<T> WindowStateUnit<T> {
     }
 }
 
+/// a wrapper for implement Debug, so we don't need to implement Debug for WindowState
+pub struct WithConnection(Box<dyn FnOnce() -> Result<Connection, ConnectError>>);
+
+impl Debug for WithConnection {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        f.write_str("WithConnection Callback")
+    }
+}
+
+impl<F> From<F> for WithConnection
+where
+    F: 'static + FnOnce() -> Result<Connection, ConnectError>,
+{
+    fn from(value: F) -> Self {
+        Self(Box::new(value))
+    }
+}
+
 /// main state, store the main information
 #[derive(Debug)]
 pub struct WindowState<T> {
@@ -588,6 +609,7 @@ pub struct WindowState<T> {
     units: Vec<WindowStateUnit<T>>,
     message: Vec<(Option<id::Id>, DispatchMessageInner)>,
 
+    with_connection: Option<WithConnection>,
     connection: Option<Connection>,
     event_queue: Option<EventQueue<WindowState<T>>>,
     wl_compositor: Option<WlCompositor>,
@@ -969,6 +991,12 @@ impl<T> WindowState<T> {
         self.use_display_handle = use_display_handle;
         self
     }
+
+    /// set a callback to create a wayland connection
+    pub fn with_connection(mut self, with_connection: Option<WithConnection>) -> Self {
+        self.with_connection = with_connection;
+        self
+    }
 }
 
 impl<T> Default for WindowState<T> {
@@ -983,6 +1011,7 @@ impl<T> Default for WindowState<T> {
             background_surface: None,
             display: None,
 
+            with_connection: None,
             connection: None,
             event_queue: None,
             wl_compositor: None,
@@ -1892,7 +1921,11 @@ delegate_noop!(@<T> WindowState<T>: ignore ZwpInputPanelV1);
 impl<T: 'static> WindowState<T> {
     /// build a new WindowState
     pub fn build(mut self) -> Result<Self, LayerEventError> {
-        let connection = Connection::connect_to_env()?;
+        let connection = if let Some(f) = self.with_connection.take() {
+            f.0()?
+        } else {
+            Connection::connect_to_env()?
+        };
         let (globals, _) = registry_queue_init::<BaseState>(&connection)?; // We just need the
         // global, the
         // event_queue is

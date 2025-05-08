@@ -196,6 +196,7 @@ pub trait Program: Sized {
             default_text_size: settings.default_text_size,
             antialiasing: settings.antialiasing,
             virtual_keyboard_support: settings.virtual_keyboard_support,
+            with_connection: settings.with_connection,
         };
         #[allow(clippy::needless_update)]
         let renderer_settings = iced_graphics::Settings {
