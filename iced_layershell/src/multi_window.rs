@@ -262,7 +262,10 @@ where
                 };
 
                 if let Some((width, height, scale_float)) = refresh_params {
-                    let Some(unit) = ev.get_mut_unit_with_id(sended_id.unwrap()) else {
+                    let Some(sended_id) = sended_id else {
+                        unreachable!("no sended_id");
+                    };
+                    let Some(unit) = ev.get_mut_unit_with_id(sended_id) else {
                         break 'outside;
                     };
                     let width = width.unwrap_or(unit.get_size().0);
@@ -272,14 +275,14 @@ where
                     }
                     event_sender
                         .start_send(MultiWindowIcedLayerEvent(
-                            sended_id,
+                            Some(sended_id),
                             IcedLayerEvent::RequestRefreshWithWrapper {
                                 width,
                                 height,
                                 fractal_scale: *scale_float,
                                 wrapper: unit.gen_wrapper(),
                                 info: unit.get_binding().cloned(),
-                                is_mouse_surface: sended_id.map(|id| ev.is_mouse_surface(id)).unwrap_or(false),
+                                is_mouse_surface: ev.is_mouse_surface(sended_id),
                             },
                         ))
                         .expect("Cannot send");
@@ -306,6 +309,19 @@ where
                         IcedLayerEvent::NormalUpdate,
                     ))
                     .expect("Cannot send");
+            }
+            LayerEvent::WindowClosed => {
+                let Some(unit) = sended_id.and_then(|unit_id| ev.get_mut_unit_with_id(unit_id)) else {
+                    return def_returndata;
+                };
+                if let Some(id) = unit.get_binding() {
+                    event_sender
+                        .start_send(MultiWindowIcedLayerEvent(
+                                sended_id,
+                                IcedLayerEvent::WindowRemoved(*id),
+                        ))
+                        .expect("Cannot send");
+                }
             }
             _ => {}
         }
