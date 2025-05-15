@@ -211,9 +211,8 @@ where
     let _ = ev.running_with_proxy(message_receiver, move |event, ev, index| {
         use layershellev::DispatchMessage;
         let mut def_returndata = ReturnData::None;
-        let sended_id = index
-            .and_then(|index| ev.get_unit_with_id(index))
-            .map(|unit| unit.id());
+        let unit = index.and_then(|index| ev.get_unit_with_id(index));
+        let sended_id = unit.map(|unit| unit.id());
         match event {
             LayerEvent::InitRequest => {
                 def_returndata = ReturnData::RequestBind;
@@ -245,40 +244,24 @@ where
                 }
             }
             LayerEvent::RequestMessages(message) => 'outside: {
-                let refresh_params = match message {
-                    DispatchMessage::RequestRefresh {
+                if let DispatchMessage::RequestRefresh {
                         width,
                         height,
                         scale_float,
                         ..
-                    } => {
-                        Some((Some(*width), Some(*height), scale_float))
-                    },
-                    // There is no configure event for input panel surface like layer shell surface, so we use scale event to let input panel surface to be presented.
-                    DispatchMessage::PreferredScale { scale_u32: _, scale_float } => {
-                        Some((None, None, scale_float))
-                    }
-                    _ => None,
-                };
-
-                if let Some((width, height, scale_float)) = refresh_params {
+                    } = &message {
                     let Some(sended_id) = sended_id else {
                         unreachable!("no sended_id");
                     };
-                    let Some(unit) = ev.get_mut_unit_with_id(sended_id) else {
+                    let Some(unit) = unit else {
                         break 'outside;
                     };
-                    let width = width.unwrap_or(unit.get_size().0);
-                    let height = height.unwrap_or(unit.get_size().1);
-                    if width == 0 || height == 0 {
-                        break 'outside;
-                    }
                     event_sender
                         .start_send(MultiWindowIcedLayerEvent(
                             Some(sended_id),
                             IcedLayerEvent::RequestRefreshWithWrapper {
-                                width,
-                                height,
+                                width: *width,
+                                height: *height,
                                 fractal_scale: *scale_float,
                                 wrapper: unit.gen_wrapper(),
                                 info: unit.get_binding().cloned(),
@@ -311,14 +294,14 @@ where
                     .expect("Cannot send");
             }
             LayerEvent::WindowClosed => {
-                let Some(unit) = sended_id.and_then(|unit_id| ev.get_mut_unit_with_id(unit_id)) else {
+                let Some(unit) = unit else {
                     return def_returndata;
                 };
                 if let Some(id) = unit.get_binding() {
                     event_sender
                         .start_send(MultiWindowIcedLayerEvent(
-                                sended_id,
-                                IcedLayerEvent::WindowRemoved(*id),
+                            sended_id,
+                            IcedLayerEvent::WindowRemoved(*id),
                         ))
                         .expect("Cannot send");
                 }
@@ -450,14 +433,8 @@ where
                                 Some(info),
                             )));
                         }
-                        LayershellCustomActions::RemoveWindow(id) => {
-                            ev.remove_shell(option_id.unwrap());
-                            event_sender
-                                .start_send(MultiWindowIcedLayerEvent(
-                                    None,
-                                    IcedLayerEvent::WindowRemoved(id),
-                                ))
-                                .ok();
+                        LayershellCustomActions::RemoveWindow(_) => {
+                            option_id.map(|unit_id| ev.request_close(unit_id));
                         }
                         LayershellCustomActions::NewPopUp {
                             settings: menusettings,
@@ -525,10 +502,10 @@ where
                     )));
                 }
                 LayerShellAction::RedrawAll => {
-                    ev.append_return_data(ReturnData::RedrawAllRequest);
+                    ev.request_refresh_all();
                 }
                 LayerShellAction::RedrawWindow(index) => {
-                    ev.append_return_data(ReturnData::RedrawIndexRequest(index));
+                    ev.request_refresh(index);
                 }
                 _ => {}
             }
@@ -575,7 +552,6 @@ async fn run_instance<A, E, C>(
         HashMap::new();
 
     let mut clipboard = LayerShellClipboard::unconnected();
-    let mut ui_caches: HashMap<window::Id, user_interface::Cache> = HashMap::new();
 
     let mut user_interfaces = ManuallyDrop::new(build_user_interfaces(
         &application,
@@ -625,7 +601,9 @@ async fn run_instance<A, E, C>(
                     is_mouse_surface,
                 },
             ) => {
-                let mut is_new_window = false;
+                // events may not be handled after RequestRefreshWithWrapper in the same
+                // interaction, we dispatched them immediately.
+                let mut events = Vec::new();
                 let (id, window) =
                     if let Some((id, window)) = window_manager.get_mut_alias(wrapper.id()) {
                         let window_size = window.state.window_size();
@@ -648,7 +626,6 @@ async fn run_instance<A, E, C>(
                         (id, window)
                     } else {
                         let wrapper = Arc::new(wrapper);
-                        is_new_window = true;
                         let id = info.unwrap_or_else(window::Id::unique);
                         if compositor.is_none() {
                             replace_compositor!(wrapper);
@@ -675,25 +652,19 @@ async fn run_instance<A, E, C>(
                                 id,
                             ),
                         );
-                        let _ = ui_caches.insert(id, user_interface::Cache::default());
 
-                        events.push((
-                            Some(id),
-                            Event::Window(window::Event::Opened {
-                                position: None,
-                                size: window.state.window_size_f32(),
-                            }),
-                        ));
+                        events.push(Event::Window(window::Event::Opened {
+                            position: None,
+                            size: window.state.window_size_f32(),
+                        }));
                         (id, window)
                     };
+
                 let compositor = compositor
                     .as_mut()
                     .expect("The compositor should have been created");
 
                 let ui = user_interfaces.get_mut(&id).expect("Get User interface");
-
-                let redraw_event =
-                    iced_core::Event::Window(window::Event::RedrawRequested(Instant::now()));
 
                 let cursor = if is_mouse_surface {
                     window.state.cursor()
@@ -701,30 +672,16 @@ async fn run_instance<A, E, C>(
                     Cursor::Unavailable
                 };
 
-                events.push((Some(id), redraw_event.clone()));
-                ui.update(
-                    &[redraw_event.clone()],
+                events.push(iced_core::Event::Window(window::Event::RedrawRequested(
+                    Instant::now(),
+                )));
+                let (_, statuses) = ui.update(
+                    &events,
                     cursor,
                     &mut window.renderer,
                     &mut clipboard,
                     &mut messages,
                 );
-
-                debug.draw_started();
-                let new_mouse_interaction = ui.draw(
-                    &mut window.renderer,
-                    window.state.theme(),
-                    &iced_core::renderer::Style {
-                        text_color: window.state.text_color(),
-                    },
-                    cursor,
-                );
-                debug.draw_finished();
-
-                if new_mouse_interaction != window.mouse_interaction {
-                    custom_actions.push(LayerShellAction::Mouse(new_mouse_interaction));
-                    window.mouse_interaction = new_mouse_interaction;
-                }
 
                 let physical_size = window.state.viewport().physical_size();
 
@@ -744,47 +701,54 @@ async fn run_instance<A, E, C>(
                     );
                 }
 
-                runtime.broadcast(iced_futures::subscription::Event::Interaction {
-                    window: id,
-                    event: redraw_event.clone(),
-                    status: iced_core::event::Status::Ignored,
-                });
+                for (idx, event) in events.into_iter().enumerate() {
+                    let status = statuses
+                        .get(idx)
+                        .cloned()
+                        .unwrap_or(iced_core::event::Status::Ignored);
+                    runtime.broadcast(iced_futures::subscription::Event::Interaction {
+                        window: id,
+                        event,
+                        status,
+                    });
+                }
                 debug.render_started();
 
                 debug.draw_started();
-                ui.draw(
+                let new_mouse_interaction = ui.draw(
                     &mut window.renderer,
-                    &application.theme(id),
+                    window.state.theme(),
                     &iced_core::renderer::Style {
                         text_color: window.state.text_color(),
                     },
-                    window.state.cursor(),
+                    cursor,
                 );
                 debug.draw_finished();
-                if !is_new_window {
-                    match compositor.present(
-                        &mut window.renderer,
-                        &mut window.surface,
-                        window.state.viewport(),
-                        window.state.background_color(),
-                        &debug.overlay(),
-                    ) {
-                        Ok(()) => {
-                            debug.render_finished();
-                        }
-                        Err(error) => match error {
-                            compositor::SurfaceError::OutOfMemory => {
-                                panic!("{:?}", error);
-                            }
-                            _ => {
-                                debug.render_finished();
-                                tracing::error!(
-                                    "Error {error:?} when \
-                                        presenting surface."
-                                );
-                            }
-                        },
+
+                if new_mouse_interaction != window.mouse_interaction {
+                    custom_actions.push(LayerShellAction::Mouse(new_mouse_interaction));
+                    window.mouse_interaction = new_mouse_interaction;
+                }
+                match compositor.present(
+                    &mut window.renderer,
+                    &mut window.surface,
+                    window.state.viewport(),
+                    window.state.background_color(),
+                    &debug.overlay(),
+                ) {
+                    Ok(()) => {
+                        debug.render_finished();
                     }
+                    Err(error) => match error {
+                        compositor::SurfaceError::OutOfMemory => {
+                            panic!("{:?}", error);
+                        }
+                        _ => {
+                            // we can't reset the present available state here, the window will
+                            // will never be redrawn.
+                            panic!("Error {error:?} when presenting surface.");
+                        }
+                    },
                 }
             }
             MultiWindowIcedLayerEvent(None, IcedLayerEvent::Window(event)) => {
@@ -849,9 +813,7 @@ async fn run_instance<A, E, C>(
 
                 debug.event_processing_started();
 
-                let mut window_refresh_events = vec![];
-                let mut uis_stale = false;
-                let mut has_window_event = false;
+                let mut rebuilts = Vec::new();
                 for (id, window) in window_manager.iter_mut() {
                     let mut window_events = vec![];
 
@@ -868,10 +830,6 @@ async fn run_instance<A, E, C>(
                         continue;
                     }
 
-                    if !window_events.is_empty() {
-                        has_window_event = true;
-                    }
-
                     let (ui_state, statuses) = user_interfaces
                         .get_mut(&id)
                         .expect("Get user interface")
@@ -883,9 +841,22 @@ async fn run_instance<A, E, C>(
                             &mut messages,
                         );
 
-                    window_refresh_events.push(LayerShellAction::RedrawWindow(window.id));
-                    if !uis_stale {
-                        uis_stale = matches!(ui_state, user_interface::State::Outdated);
+                    custom_actions.push(LayerShellAction::RedrawWindow(window.id));
+                    match ui_state {
+                        user_interface::State::Outdated => rebuilts.push((id, window)),
+                        // TODO support redraw at
+                        user_interface::State::Updated {
+                            redraw_request: Some(_),
+                        } => {}
+                        user_interface::State::Updated {
+                            redraw_request: None,
+                        } => {
+                            // no redraw
+                            // custom_actions.pop();
+
+                            // redraw anyway. in iced 0.13.1, most widget doesn't set redraw
+                            // request.
+                        }
                     }
 
                     debug.event_processing_finished();
@@ -899,14 +870,8 @@ async fn run_instance<A, E, C>(
                     }
                 }
 
-                let mut already_redraw_all = false;
-                if has_window_event {
+                if !messages.is_empty() {
                     custom_actions.push(LayerShellAction::RedrawAll);
-                    already_redraw_all = true;
-                }
-
-                // TODO mw application update returns which window IDs to update
-                if !messages.is_empty() || uis_stale {
                     let cached_user_interfaces: HashMap<window::Id, user_interface::Cache> =
                         ManuallyDrop::into_inner(user_interfaces)
                             .drain()
@@ -919,19 +884,28 @@ async fn run_instance<A, E, C>(
                     for (_id, window) in window_manager.iter_mut() {
                         window.state.synchronize(&application);
                     }
-
                     user_interfaces = ManuallyDrop::new(build_user_interfaces(
                         &application,
                         &mut debug,
                         &mut window_manager,
                         cached_user_interfaces,
                     ));
-                }
-
-                // NOTE: only append the target window refresh event when not invoke the redrawAll
-                // event. This will make the events fewer.
-                if !already_redraw_all {
-                    custom_actions.append(&mut window_refresh_events);
+                } else {
+                    for (id, window) in rebuilts {
+                        if let Some(ui) = user_interfaces.remove(&id) {
+                            user_interfaces.insert(
+                                id,
+                                build_user_interface(
+                                    &application,
+                                    ui.into_cache(),
+                                    &mut window.renderer,
+                                    window.state.viewport().logical_size(),
+                                    &mut debug,
+                                    id,
+                                ),
+                            );
+                        }
+                    }
                 }
             }
             MultiWindowIcedLayerEvent(_, IcedLayerEvent::WindowRemoved(id)) => {
@@ -1140,7 +1114,6 @@ pub(crate) fn run_action<A, C>(
                 messages.push(stream);
             }
         },
-
         Action::Clipboard(action) => match action {
             clipboard::Action::Read { target, channel } => {
                 let _ = channel.send(clipboard.read(target));
@@ -1166,7 +1139,7 @@ pub(crate) fn run_action<A, C>(
 
                         match operation.finish() {
                             operation::Outcome::None => {}
-                            operation::Outcome::Some(_message) => {
+                            operation::Outcome::Some(()) => {
                                 //proxy.send_event(message).ok();
 
                                 // operation completed, don't need to try to operate on rest of UIs

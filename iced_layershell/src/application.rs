@@ -327,10 +327,10 @@ where
                     )));
                 }
                 LayerShellAction::RedrawAll => {
-                    ev.append_return_data(ReturnData::RedrawAllRequest);
+                    ev.request_refresh_all();
                 }
                 LayerShellAction::RedrawWindow(index) => {
-                    ev.append_return_data(ReturnData::RedrawIndexRequest(index));
+                    ev.request_refresh(index);
                 }
                 _ => {}
             }
@@ -465,17 +465,6 @@ async fn run_instance<A, E, C>(
                 // TODO: check mouse_interaction
 
                 debug.render_started();
-
-                debug.draw_started();
-                user_interface.draw(
-                    &mut renderer,
-                    &application.theme(),
-                    &iced_core::renderer::Style {
-                        text_color: state.text_color(),
-                    },
-                    state.cursor(),
-                );
-                debug.draw_finished();
 
                 match compositor.present(
                     &mut renderer,

@@ -129,6 +129,7 @@ use strtoshape::str_to_shape;
 
 use waycrate_xkbkeycode::xkb_keyboard::RepeatInfo;
 
+use wayland_client::protocol::wl_callback::{Event as WlCallbackEvent, WlCallback};
 use wayland_client::{
     ConnectError, Connection, Dispatch, DispatchError, EventQueue, Proxy, QueueHandle, WEnum,
     delegate_noop,
@@ -349,6 +350,15 @@ impl PartialEq<XdgPopup> for Shell {
     }
 }
 
+impl PartialEq<XdgSurface> for Shell {
+    fn eq(&self, other: &XdgSurface) -> bool {
+        match self {
+            Self::PopUp((_, surface)) => surface == other,
+            _ => false,
+        }
+    }
+}
+
 impl Shell {
     fn destroy(&self) {
         match self {
@@ -366,9 +376,106 @@ impl Shell {
     }
 }
 
+/// The state of if we can call a `present` for the window.
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentAvailableState {
+    /// No `wl_surface.frame` requested.
+    None,
+    /// A `wl_surface.frame` request has been sent, and there is no callback yet.
+    Requested,
+    /// A notification has been received, it is a good time to start drawing a new frame. Because
+    /// there is no present at first, so the default state is available.
+    #[default]
+    Available,
+}
+
+struct WindowStateUnitBuilder<T> {
+    inner: WindowStateUnit<T>,
+}
+
+impl<T> WindowStateUnitBuilder<T> {
+    fn new(
+        id: id::Id,
+        qh: QueueHandle<WindowState<T>>,
+        display: WlDisplay,
+        wl_surface: WlSurface,
+        shell: Shell,
+    ) -> Self {
+        Self {
+            inner: WindowStateUnit {
+                id,
+                qh,
+                display,
+                wl_surface,
+                shell,
+                size: (0, 0),
+                buffer: Default::default(),
+                zxdgoutput: Default::default(),
+                fractional_scale: Default::default(),
+                viewport: Default::default(),
+                wl_output: Default::default(),
+                binding: Default::default(),
+                becreated: Default::default(),
+                // Unknown why it is 120
+                scale: 120,
+                request_flag: Default::default(),
+                present_available_state: Default::default(),
+            },
+        }
+    }
+
+    fn build(self) -> WindowStateUnit<T> {
+        self.inner
+    }
+
+    fn size(mut self, size: (u32, u32)) -> Self {
+        self.inner.size = size;
+        self
+    }
+
+    fn zxdgoutput(mut self, zxdgoutput: Option<ZxdgOutputInfo>) -> Self {
+        self.inner.zxdgoutput = zxdgoutput;
+        self
+    }
+
+    fn fractional_scale(mut self, fractional_scale: Option<WpFractionalScaleV1>) -> Self {
+        self.inner.fractional_scale = fractional_scale;
+        self
+    }
+
+    fn viewport(mut self, viewport: Option<WpViewport>) -> Self {
+        self.inner.viewport = viewport;
+        self
+    }
+
+    fn wl_output(mut self, wl_output: Option<WlOutput>) -> Self {
+        self.inner.wl_output = wl_output;
+        self
+    }
+
+    fn binding(mut self, binding: Option<T>) -> Self {
+        self.inner.binding = binding;
+        self
+    }
+
+    fn becreated(mut self, becreated: bool) -> Self {
+        self.inner.becreated = becreated;
+        self
+    }
+}
+
+#[derive(Debug, Default)]
+struct WindowStateUnitRequestFlag {
+    /// The flag of if this window has been requested to be closed.
+    close: bool,
+    /// The flag of if this window has been requested to be refreshed.
+    refresh: bool,
+}
+
 #[derive(Debug)]
 pub struct WindowStateUnit<T> {
     id: id::Id,
+    qh: QueueHandle<WindowState<T>>,
     display: WlDisplay,
     wl_surface: WlSurface,
     size: (u32, u32),
@@ -382,6 +489,9 @@ pub struct WindowStateUnit<T> {
     becreated: bool,
 
     scale: u32,
+
+    request_flag: WindowStateUnitRequestFlag,
+    present_available_state: PresentAvailableState,
 }
 
 impl<T> WindowStateUnit<T> {
@@ -567,9 +677,10 @@ impl<T> WindowStateUnit<T> {
 
     /// this function will refresh whole surface. it will reattach the buffer, and damage whole,
     /// and final commit
-    pub fn request_refresh(&self, (width, height): (i32, i32)) {
+    pub fn refresh(&self) {
         self.wl_surface.attach(self.buffer.as_ref(), 0, 0);
-        self.wl_surface.damage(0, 0, width, height);
+        self.wl_surface
+            .damage(0, 0, self.size.0 as i32, self.size.1 as i32);
         self.wl_surface.commit();
     }
 
@@ -579,6 +690,39 @@ impl<T> WindowStateUnit<T> {
 
     pub fn scale_float(&self) -> f64 {
         self.scale as f64 / 120.
+    }
+
+    pub fn request_close(&mut self) {
+        self.request_flag.close = true;
+    }
+
+    pub fn request_refresh(&mut self) {
+        self.request_flag.refresh = true;
+    }
+
+    pub fn take_present_slot(&mut self) -> bool {
+        if !self.request_flag.refresh {
+            return false;
+        }
+        if self.present_available_state != PresentAvailableState::Available {
+            return false;
+        }
+        self.request_flag.refresh = false;
+        self.present_available_state = PresentAvailableState::None;
+        true
+    }
+}
+
+impl<T: 'static> WindowStateUnit<T> {
+    pub fn request_next_present(&mut self) {
+        match self.present_available_state {
+            PresentAvailableState::None => {
+                self.present_available_state = PresentAvailableState::Requested;
+                self.wl_surface
+                    .frame(&self.qh, (self.id, PresentAvailableState::Available));
+            }
+            PresentAvailableState::Requested | PresentAvailableState::Available => {}
+        }
     }
 }
 
@@ -665,7 +809,7 @@ impl<T> WindowState<T> {
         self.return_data.push(data);
     }
     /// remove a shell, destroy the surface
-    pub fn remove_shell(&mut self, id: id::Id) -> Option<()> {
+    fn remove_shell(&mut self, id: id::Id) -> Option<()> {
         let index = self
             .units
             .iter()
@@ -1058,9 +1202,6 @@ impl<T> Default for WindowState<T> {
 }
 
 impl<T> WindowState<T> {
-    fn get_id_list(&self) -> Vec<id::Id> {
-        self.units.iter().map(|unit| unit.id).collect()
-    }
     /// You can save the virtual_keyboard here
     pub fn set_virtual_keyboard(&mut self, keyboard: ZwpVirtualKeyboardV1) {
         self.virtual_keyboard = Some(keyboard);
@@ -1077,7 +1218,7 @@ impl<T> WindowState<T> {
     }
 
     /// use [id::Id] to get the mut [WindowStateUnit]
-    pub fn get_mut_unit_with_id(&mut self, id: id::Id) -> Option<&mut WindowStateUnit<T>> {
+    fn get_mut_unit_with_id(&mut self, id: id::Id) -> Option<&mut WindowStateUnit<T>> {
         self.units.iter_mut().find(|unit| unit.id == id)
     }
 
@@ -1089,11 +1230,6 @@ impl<T> WindowState<T> {
     /// it return the iter of units. you can do loop with it
     pub fn get_unit_iter(&self) -> impl Iterator<Item = &WindowStateUnit<T>> {
         self.units.iter()
-    }
-
-    /// it return the mut iter of units. you can do loop with it
-    pub fn get_unit_iter_mut(&mut self) -> impl Iterator<Item = &mut WindowStateUnit<T>> {
-        self.units.iter_mut()
     }
 
     fn surface_pos(&self) -> Option<usize> {
@@ -1157,6 +1293,27 @@ impl<T> WindowState<T> {
                     .unwrap_or(0);
             }
         }
+    }
+
+    pub fn request_refresh_all(&mut self) {
+        self.units
+            .iter_mut()
+            .for_each(WindowStateUnit::request_refresh);
+    }
+
+    pub fn request_refresh(&mut self, id: id::Id) {
+        self.get_mut_unit_with_id(id)
+            .map(WindowStateUnit::request_refresh);
+    }
+
+    pub fn request_close(&mut self, id: id::Id) {
+        self.get_mut_unit_with_id(id)
+            .map(WindowStateUnit::request_close);
+    }
+
+    pub fn get_binding_mut(&mut self, id: id::Id) -> Option<&mut T> {
+        self.get_mut_unit_with_id(id)
+            .and_then(WindowStateUnit::get_binding_mut)
     }
 }
 
@@ -1719,7 +1876,7 @@ impl<T> Dispatch<wl_pointer::WlPointer, ()> for WindowState<T> {
 
 impl<T> Dispatch<xdg_surface::XdgSurface, ()> for WindowState<T> {
     fn event(
-        _state: &mut Self,
+        state: &mut Self,
         surface: &xdg_surface::XdgSurface,
         event: <xdg_surface::XdgSurface as Proxy>::Event,
         _data: &(),
@@ -1728,6 +1885,11 @@ impl<T> Dispatch<xdg_surface::XdgSurface, ()> for WindowState<T> {
     ) {
         if let xdg_surface::Event::Configure { serial } = event {
             surface.ack_configure(serial);
+            state
+                .units
+                .iter_mut()
+                .filter(|unit| unit.shell == *surface)
+                .for_each(WindowStateUnit::request_refresh);
         }
     }
 }
@@ -1754,17 +1916,12 @@ impl<T> Dispatch<zwlr_layer_surface_v1::ZwlrLayerSurfaceV1, ()> for WindowState<
                 };
                 state.units[unit_index].size = (width, height);
 
-                state.message.push((
-                    Some(state.units[unit_index].id),
-                    DispatchMessageInner::RefreshSurface { width, height },
-                ));
+                state.units[unit_index].request_refresh();
             }
             zwlr_layer_surface_v1::Event::Closed => {
-                let unit_id = unit_index.map(|i| state.units[i].id);
-
-                state
-                    .message
-                    .push((unit_id, DispatchMessageInner::WindowClosed));
+                if let Some(i) = unit_index {
+                    state.units[i].request_close();
+                }
             }
             _ => log::info!("ignore zwlr_layer_surface_v1 event: {event:?}"),
         }
@@ -1785,16 +1942,8 @@ impl<T> Dispatch<xdg_popup::XdgPopup, ()> for WindowState<T> {
             else {
                 return;
             };
-            let id = state.units[unit_index].id;
             state.units[unit_index].size = (width as u32, height as u32);
-
-            state.message.push((
-                Some(id),
-                DispatchMessageInner::RefreshSurface {
-                    width: width as u32,
-                    height: height as u32,
-                },
-            ));
+            state.units[unit_index].request_refresh();
         }
     }
 }
@@ -1888,6 +2037,7 @@ impl<T> Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WindowStat
                 return;
             };
             unit.scale = scale;
+            unit.request_refresh();
             state.message.push((
                 Some(unit.id),
                 DispatchMessageInner::PreferredScale {
@@ -1895,6 +2045,23 @@ impl<T> Dispatch<wp_fractional_scale_v1::WpFractionalScaleV1, ()> for WindowStat
                     scale_float: scale as f64 / 120.,
                 },
             ));
+        }
+    }
+}
+
+impl<T> Dispatch<WlCallback, (id::Id, PresentAvailableState)> for WindowState<T> {
+    fn event(
+        state: &mut Self,
+        _proxy: &WlCallback,
+        event: <WlCallback as Proxy>::Event,
+        data: &(id::Id, PresentAvailableState),
+        _conn: &Connection,
+        _qhandle: &QueueHandle<Self>,
+    ) {
+        if let WlCallbackEvent::Done { callback_data: _ } = event {
+            if let Some(unit) = state.get_mut_unit_with_id(data.0) {
+                unit.present_available_state = data.1;
+            }
         }
     }
 }
@@ -2064,21 +2231,19 @@ impl<T: 'static> WindowState<T> {
             // and if you need to reconfigure it, you need to commit the wl_surface again
             // so because this is just an example, so we just commit it once
             // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
-            self.push_window(WindowStateUnit {
-                id: id::Id::unique(),
-                display: connection.display(),
-                wl_surface,
-                size: (0, 0),
-                buffer: None,
-                shell: Shell::LayerShell(layer),
-                viewport,
-                zxdgoutput: binded_xdginfo.cloned(),
-                fractional_scale,
-                binding: None,
-                becreated: false,
-                wl_output: None,
-                scale: 120,
-            });
+            self.push_window(
+                WindowStateUnitBuilder::new(
+                    id::Id::unique(),
+                    qh.clone(),
+                    connection.display(),
+                    wl_surface,
+                    Shell::LayerShell(layer),
+                )
+                .viewport(viewport)
+                .zxdgoutput(binded_xdginfo.cloned())
+                .fractional_scale(fractional_scale)
+                .build(),
+            );
         } else {
             let displays = self.outputs.clone();
             for (_, output_display) in displays.iter() {
@@ -2129,21 +2294,20 @@ impl<T: 'static> WindowState<T> {
                 // so because this is just an example, so we just commit it once
                 // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
 
-                self.push_window(WindowStateUnit {
-                    id: id::Id::unique(),
-                    display: connection.display(),
-                    wl_surface,
-                    size: (0, 0),
-                    buffer: None,
-                    shell: Shell::LayerShell(layer),
-                    zxdgoutput: Some(ZxdgOutputInfo::new(zxdgoutput)),
-                    fractional_scale,
-                    viewport,
-                    binding: None,
-                    becreated: false,
-                    wl_output: Some(output_display.clone()),
-                    scale: 120,
-                });
+                self.push_window(
+                    WindowStateUnitBuilder::new(
+                        id::Id::unique(),
+                        qh.clone(),
+                        connection.display(),
+                        wl_surface,
+                        Shell::LayerShell(layer),
+                    )
+                    .viewport(viewport)
+                    .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
+                    .fractional_scale(fractional_scale)
+                    .wl_output(Some(output_display.clone()))
+                    .build(),
+                );
             }
             self.message.clear();
         }
@@ -2278,40 +2442,6 @@ impl<T: 'static> WindowState<T> {
             std::mem::swap(&mut messages, &mut self.message);
             for msg in messages.iter() {
                 match msg {
-                    (Some(unit_index), DispatchMessageInner::RefreshSurface { width, height }) => {
-                        let Some(index) = self.units.iter().position(|unit| unit.id == *unit_index)
-                        else {
-                            continue;
-                        };
-                        if self.units[index].buffer.is_none() && !self.use_display_handle {
-                            let mut file = tempfile::tempfile()?;
-                            let ReturnData::WlBuffer(buffer) = event_handler(
-                                LayerEvent::RequestBuffer(&mut file, &shm, &qh, *width, *height),
-                                &mut self,
-                                Some(*unit_index),
-                            ) else {
-                                panic!("You cannot return this one");
-                            };
-                            let surface = &self.units[index].wl_surface;
-                            surface.attach(Some(&buffer), 0, 0);
-                            self.units[index].buffer = Some(buffer);
-                        } else {
-                            event_handler(
-                                LayerEvent::RequestMessages(&DispatchMessage::RequestRefresh {
-                                    width: *width,
-                                    height: *height,
-                                    is_created: self.units[index].becreated,
-                                    scale_float: self.units[index].scale_float(),
-                                }),
-                                &mut self,
-                                Some(*unit_index),
-                            );
-                        }
-
-                        if let Some(unit) = self.get_unit_with_id(*unit_index) {
-                            unit.wl_surface.commit();
-                        }
-                    }
                     (index_info, DispatchMessageInner::XdgInfoChanged(change_type)) => {
                         event_handler(
                             LayerEvent::XdgInfoChanged(*change_type),
@@ -2373,28 +2503,20 @@ impl<T: 'static> WindowState<T> {
                         // so because this is just an example, so we just commit it once
                         // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
 
-                        self.push_window(WindowStateUnit {
-                            id: id::Id::unique(),
-                            display: connection.display(),
-                            wl_surface,
-                            size: (0, 0),
-                            buffer: None,
-                            shell: Shell::LayerShell(layer),
-                            zxdgoutput: Some(ZxdgOutputInfo::new(zxdgoutput)),
-                            fractional_scale,
-                            viewport,
-                            binding: None,
-                            becreated: false,
-                            wl_output: Some(output_display.clone()),
-                            scale: 120,
-                        });
-                    }
-                    (unit_id, DispatchMessageInner::WindowClosed) => {
-                        let Some(unit_id) = unit_id.clone() else {
-                            continue;
-                        };
-                        event_handler(LayerEvent::WindowClosed, &mut self, Some(unit_id));
-                        self.remove_shell(unit_id);
+                        self.push_window(
+                            WindowStateUnitBuilder::new(
+                                id::Id::unique(),
+                                qh.clone(),
+                                connection.display(),
+                                wl_surface,
+                                Shell::LayerShell(layer),
+                            )
+                            .viewport(viewport)
+                            .zxdgoutput(Some(ZxdgOutputInfo::new(zxdgoutput)))
+                            .fractional_scale(fractional_scale)
+                            .wl_output(Some(output_display.clone()))
+                            .build(),
+                        );
                     }
                     _ => {
                         let (index_message, msg) = msg;
@@ -2405,44 +2527,6 @@ impl<T: 'static> WindowState<T> {
                             &mut self,
                             *index_message,
                         ) {
-                            ReturnData::RedrawAllRequest => {
-                                let idlist = self.get_id_list();
-                                for id in idlist {
-                                    if let Some(unit) = self.get_unit_with_id(id) {
-                                        if unit.size.0 == 0 || unit.size.1 == 0 {
-                                            continue;
-                                        }
-                                        event_handler(
-                                            LayerEvent::RequestMessages(
-                                                &DispatchMessage::RequestRefresh {
-                                                    width: unit.size.0,
-                                                    height: unit.size.1,
-                                                    is_created: unit.becreated,
-                                                    scale_float: unit.scale_float(),
-                                                },
-                                            ),
-                                            &mut self,
-                                            Some(id),
-                                        );
-                                    }
-                                }
-                            }
-                            ReturnData::RedrawIndexRequest(id) => {
-                                if let Some(unit) = self.get_unit_with_id(id) {
-                                    event_handler(
-                                        LayerEvent::RequestMessages(
-                                            &DispatchMessage::RequestRefresh {
-                                                width: unit.size.0,
-                                                height: unit.size.1,
-                                                is_created: unit.becreated,
-                                                scale_float: unit.scale_float(),
-                                            },
-                                        ),
-                                        &mut self,
-                                        Some(id),
-                                    );
-                                }
-                            }
                             ReturnData::RequestExit => {
                                 break 'out;
                             }
@@ -2488,42 +2572,6 @@ impl<T: 'static> WindowState<T> {
                 let mut replace_data = Vec::new();
                 for data in return_data {
                     match data {
-                        ReturnData::RedrawAllRequest => {
-                            let idlist = self.get_id_list();
-                            for id in idlist {
-                                if let Some(unit) = self.get_unit_with_id(id) {
-                                    if unit.size.0 == 0 || unit.size.1 == 0 {
-                                        continue;
-                                    }
-                                    event_handler(
-                                        LayerEvent::RequestMessages(
-                                            &DispatchMessage::RequestRefresh {
-                                                width: unit.size.0,
-                                                height: unit.size.1,
-                                                is_created: unit.becreated,
-                                                scale_float: unit.scale_float(),
-                                            },
-                                        ),
-                                        &mut self,
-                                        Some(id),
-                                    );
-                                }
-                            }
-                        }
-                        ReturnData::RedrawIndexRequest(id) => {
-                            if let Some(unit) = self.get_unit_with_id(id) {
-                                replace_data.push(event_handler(
-                                    LayerEvent::RequestMessages(&DispatchMessage::RequestRefresh {
-                                        width: unit.size.0,
-                                        height: unit.size.1,
-                                        is_created: unit.becreated,
-                                        scale_float: unit.scale_float(),
-                                    }),
-                                    &mut self,
-                                    Some(id),
-                                ));
-                            }
-                        }
                         ReturnData::RequestExit => {
                             break 'out;
                         }
@@ -2613,21 +2661,21 @@ impl<T: 'static> WindowState<T> {
                             // so because this is just an example, so we just commit it once
                             // like if you want to reset anchor or KeyboardInteractivity or resize, commit is needed
 
-                            self.push_window(WindowStateUnit {
-                                id,
-                                display: connection.display(),
-                                wl_surface,
-                                size: (0, 0),
-                                buffer: None,
-                                shell: Shell::LayerShell(layer),
-                                zxdgoutput: None,
-                                fractional_scale,
-                                viewport,
-                                becreated: true,
-                                wl_output: output.cloned(),
-                                binding: info,
-                                scale: 120,
-                            });
+                            self.push_window(
+                                WindowStateUnitBuilder::new(
+                                    id,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::LayerShell(layer),
+                                )
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .wl_output(output.cloned())
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
                         }
                         ReturnData::NewPopUp((
                             NewPopUpSettings {
@@ -2671,21 +2719,21 @@ impl<T: 'static> WindowState<T> {
                             let viewport = viewporter
                                 .as_ref()
                                 .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
-                            self.push_window(WindowStateUnit {
-                                id: targetid,
-                                display: connection.display(),
-                                wl_surface,
-                                size: (width, height),
-                                buffer: None,
-                                shell: Shell::PopUp((popup, wl_xdg_surface)),
-                                zxdgoutput: None,
-                                fractional_scale,
-                                viewport,
-                                becreated: true,
-                                wl_output: None,
-                                binding: info,
-                                scale: 120,
-                            });
+                            self.push_window(
+                                WindowStateUnitBuilder::new(
+                                    targetid,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::PopUp((popup, wl_xdg_surface)),
+                                )
+                                .size((width, height))
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
                         }
                         ReturnData::NewInputPanel((
                             NewInputPanelSettings {
@@ -2749,21 +2797,21 @@ impl<T: 'static> WindowState<T> {
                             let viewport = viewporter
                                 .as_ref()
                                 .map(|viewport| viewport.get_viewport(&wl_surface, &qh, ()));
-                            self.push_window(WindowStateUnit {
-                                id,
-                                display: connection.display(),
-                                wl_surface,
-                                size: (width, height),
-                                buffer: None,
-                                shell: Shell::InputPanel(input_panel_surface),
-                                zxdgoutput: None,
-                                fractional_scale,
-                                viewport,
-                                becreated: true,
-                                wl_output: None,
-                                binding: info,
-                                scale: 120,
-                            });
+                            self.push_window(
+                                WindowStateUnitBuilder::new(
+                                    id,
+                                    qh.clone(),
+                                    connection.display(),
+                                    wl_surface,
+                                    Shell::InputPanel(input_panel_surface),
+                                )
+                                .size((width, height))
+                                .viewport(viewport)
+                                .fractional_scale(fractional_scale)
+                                .binding(info)
+                                .becreated(true)
+                                .build(),
+                            );
                         }
                         _ => {}
                     }
@@ -2774,11 +2822,72 @@ impl<T: 'static> WindowState<T> {
                 }
                 return_data = replace_data;
             }
-            continue;
+
+            let to_be_closed_ids: Vec<_> = self
+                .units
+                .iter()
+                .filter(|unit| unit.request_flag.close)
+                .map(WindowStateUnit::id)
+                .collect();
+            for id in to_be_closed_ids {
+                event_handler(LayerEvent::WindowClosed, &mut self, Some(id));
+                // event_handler may use unit, only remove it after calling event_handler.
+                self.remove_shell(id);
+            }
+
+            for idx in 0..self.units.len() {
+                let unit = &mut self.units[idx];
+                let width = unit.size.0;
+                let height = unit.size.1;
+                if width == 0 || height == 0 {
+                    // don't refresh, if size is 0.
+                    continue;
+                }
+                if !unit.take_present_slot() {
+                    if unit.request_flag.refresh {
+                        // refresh of window is needed, request notification of starting drawing new new frame.
+                        unit.request_next_present();
+                    }
+                } else {
+                    let unit_id = unit.id;
+                    let is_created = unit.becreated;
+                    let scale_float = unit.scale_float();
+                    let wl_surface = unit.wl_surface.clone();
+                    if unit.buffer.is_none() && !self.use_display_handle {
+                        let mut file = tempfile::tempfile()?;
+                        let ReturnData::WlBuffer(buffer) = event_handler(
+                            LayerEvent::RequestBuffer(&mut file, &shm, &qh, width, height),
+                            &mut self,
+                            Some(unit_id),
+                        ) else {
+                            panic!("You cannot return this one");
+                        };
+                        wl_surface.attach(Some(&buffer), 0, 0);
+                        wl_surface.commit();
+                        self.units[idx].buffer = Some(buffer);
+                    }
+                    self.request_next_present(unit_id);
+                    event_handler(
+                        LayerEvent::RequestMessages(&DispatchMessage::RequestRefresh {
+                            width,
+                            height,
+                            is_created,
+                            scale_float,
+                        }),
+                        &mut self,
+                        Some(unit_id),
+                    );
+                }
+            }
         }
         to_exit.store(true, Ordering::Relaxed);
         let _ = thread.join();
         Ok(())
+    }
+
+    pub fn request_next_present(&mut self, id: id::Id) {
+        self.get_mut_unit_with_id(id)
+            .map(WindowStateUnit::request_next_present);
     }
 }
 

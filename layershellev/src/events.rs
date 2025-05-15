@@ -144,8 +144,6 @@ pub enum ReturnData<INFO> {
     RequestBind,
     RequestExit,
     RequestCompositor,
-    RedrawAllRequest,
-    RedrawIndexRequest(Id),
     RequestSetCursorShape((String, WlPointer)),
     NewLayerShell((NewLayerShellSettings, id::Id, Option<INFO>)),
     NewPopUp((NewPopUpSettings, id::Id, Option<INFO>)),
@@ -252,10 +250,6 @@ pub(crate) enum DispatchMessageInner {
         /// Otherwise, this value is always `false`.
         is_synthetic: bool,
     },
-    RefreshSurface {
-        width: u32,
-        height: u32,
-    },
     RequestRefresh {
         width: u32,
         height: u32,
@@ -267,8 +261,6 @@ pub(crate) enum DispatchMessageInner {
         scale_float: f64,
     },
     XdgInfoChanged(XdgInfoChangedType),
-    /// Window is closed by the wayland server.
-    WindowClosed,
 }
 
 /// This tell the DispatchMessage by dispatch
@@ -478,11 +470,7 @@ impl From<DispatchMessageInner> for DispatchMessage {
                 scale_u32,
                 scale_float,
             },
-            DispatchMessageInner::RefreshSurface { .. } => unimplemented!(),
             DispatchMessageInner::XdgInfoChanged(_) => unimplemented!(),
-            DispatchMessageInner::WindowClosed => {
-                unreachable!("WindowClosed won't be dispatched by DispatchMessage")
-            }
         }
     }
 }
