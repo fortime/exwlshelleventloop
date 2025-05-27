@@ -357,6 +357,7 @@ pub enum DispatchMessage {
         scale_u32: u32,
         scale_float: f64,
     },
+    Closed,
 }
 
 impl From<DispatchMessageInner> for DispatchMessage {

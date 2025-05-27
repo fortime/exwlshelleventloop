@@ -1,7 +1,7 @@
 use futures::future::pending;
 use iced::widget::{button, column, container, text, text_input};
 use iced::window::Id;
-use iced::{Element, Length, Task as Command, Theme};
+use iced::{Element, Length, Task as Command, Theme, event};
 use iced_layershell::to_layer_message;
 use iced_runtime::Action;
 use iced_runtime::window::Action as WindowAction;
@@ -33,6 +33,7 @@ enum Message {
     NewWindow,
     TextInput(String),
     CloseWindow(Id),
+    IcedEvent((Id, iced::Event)),
 }
 
 impl MultiApplication for Counter {
@@ -40,10 +41,6 @@ impl MultiApplication for Counter {
     type Flags = ();
     type Theme = Theme;
     type Executor = iced::executor::Default;
-
-    fn remove_id(&mut self, _id: iced_runtime::core::window::Id) {
-        self.window_shown = false;
-    }
 
     fn new(_flags: Self::Flags) -> (Self, Command<Self::Message>) {
         (
@@ -80,22 +77,28 @@ impl MultiApplication for Counter {
         .into()
     }
     fn subscription(&self) -> iced::Subscription<Self::Message> {
-        iced::Subscription::run(|| {
-            iced::stream::channel(100, |sender| async move {
-                // setup the object server
-                let _connection = connection::Builder::session()
-                    .unwrap()
-                    .name("zbus.iced.MyGreeter1")
-                    .unwrap()
-                    .serve_at("/org/zbus/MyGreeter1", Greeter { sender })
-                    .unwrap()
-                    .build()
-                    .await
-                    .unwrap();
-                pending::<()>().await;
-                unreachable!()
-            })
-        })
+        iced::Subscription::batch(vec![
+            iced::Subscription::run(|| {
+                iced::stream::channel(100, |sender| async move {
+                    // setup the object server
+                    let _connection = connection::Builder::session()
+                        .unwrap()
+                        .name("zbus.iced.MyGreeter1")
+                        .unwrap()
+                        .serve_at("/org/zbus/MyGreeter1", Greeter { sender })
+                        .unwrap()
+                        .build()
+                        .await
+                        .unwrap();
+                    pending::<()>().await;
+                    unreachable!()
+                })
+            }),
+            event::listen_with(|event, status, id| match status {
+                event::Status::Ignored => Some(Message::IcedEvent((id, event))),
+                event::Status::Captured => None,
+            }),
+        ])
     }
     fn update(&mut self, message: Self::Message) -> Command<Self::Message> {
         match message {
@@ -124,6 +127,12 @@ impl MultiApplication for Counter {
             }
             Message::TextInput(text) => {
                 self.text = text;
+                Command::none()
+            }
+            Message::IcedEvent((_id, event)) => {
+                if let iced::Event::Window(iced::window::Event::Closed) = event {
+                    self.window_shown = false;
+                }
                 Command::none()
             }
             _ => unreachable!(),
