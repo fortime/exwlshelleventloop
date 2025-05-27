@@ -78,6 +78,20 @@ where
         &self.viewport
     }
 
+    pub fn window_size(&self) -> Size<u32> {
+        self.window_size
+    }
+
+    /// using viewport physical size and wayland scale factor to calculate the actual window size.
+    /// The result may contain fractions.
+    pub fn window_size_f32(&self) -> Size<f32> {
+        let physical_size = self.viewport.physical_size();
+        Size::new(
+            (physical_size.width as f64 / self.wayland_scale_factor) as f32,
+            (physical_size.height as f64 / self.wayland_scale_factor) as f32,
+        )
+    }
+
     pub fn wayland_scale_factor(&self) -> f64 {
         self.wayland_scale_factor
     }

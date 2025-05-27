@@ -21,7 +21,6 @@ pub fn main() -> Result<(), iced_layershell::Error> {
         Counter::namespace,
         Counter::update,
         Counter::view,
-        Counter::remove_id,
     )
     .subscription(Counter::subscription)
     .settings(MainSettings {
@@ -97,10 +96,6 @@ impl Counter {
 
     fn id_info(&self, id: iced::window::Id) -> Option<WindowInfo> {
         self.ids.get(&id).cloned()
-    }
-
-    fn remove_id(&mut self, id: iced::window::Id) {
-        self.ids.remove(&id);
     }
 
     fn namespace(&self) -> String {

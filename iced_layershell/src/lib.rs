@@ -9,6 +9,7 @@ mod event;
 pub mod multi_window;
 mod proxy;
 mod sandbox;
+mod user_interface;
 
 pub mod settings;
 
@@ -280,7 +281,6 @@ pub trait MultiApplication: Sized {
     /// title of your window when necessary.
     fn namespace(&self) -> String;
 
-    fn remove_id(&mut self, _id: iced_core::window::Id) {}
     /// Handles a __message__ and updates the state of the [`Application`].
     ///
     /// This is where you define your __update logic__. All the __messages__,
@@ -424,9 +424,6 @@ where
 
     fn scale_factor(&self, window: iced::window::Id) -> f64 {
         self.0.scale_factor(window)
-    }
-    fn remove_id(&mut self, id: iced_core::window::Id) {
-        self.0.remove_id(id)
     }
 }
 #[cfg(test)]

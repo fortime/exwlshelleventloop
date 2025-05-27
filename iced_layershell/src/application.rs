@@ -1,35 +1,46 @@
 mod state;
 
-use std::{borrow::Cow, mem::ManuallyDrop, os::fd::AsFd, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow, collections::VecDeque, mem, os::fd::AsFd, sync::Arc, task::Poll, time::Duration,
+};
 
 use crate::{
-    actions::{LayerShellAction, LayerShellActionVec, LayershellCustomActions},
+    LayershellCustomActions,
     clipboard::LayerShellClipboard,
     conversion,
     error::Error,
+    event::{WaitingLayerShellEvent, WindowEvent as LayerWindowEvent},
     settings::VirtualKeyboardSettings,
+    user_interface::UserInterface,
 };
 
 use super::{Appearance, DefaultStyle};
+use iced::mouse::Interaction;
 use iced_graphics::{Compositor, compositor};
 use state::State;
 
-use iced_core::{Event as IcedCoreEvent, Size, time::Instant, window as IcedCoreWindow};
+use iced_core::{
+    Event as IcedEvent,
+    time::Instant,
+    window::{Event as IcedWindowEvent, Id as IcedId},
+};
 
-use iced_runtime::{Action, Debug, Program, UserInterface, task::Task, user_interface};
+use iced_runtime::{Action, Debug, Program, task::Task, user_interface};
 
 use iced_futures::{Executor, Runtime, Subscription};
 
 use layershellev::{
-    LayerEvent, ReturnData, StartMode, WindowWrapper,
+    LayerEvent, ReturnData, StartMode, WindowStateSimple, WindowWrapper,
     calloop::timer::{TimeoutAction, Timer},
-    reexport::wayland_client::{WlCompositor, WlRegion},
-    reexport::zwp_virtual_keyboard_v1,
+    reexport::{
+        wayland_client::{WlCompositor, WlRegion},
+        zwp_virtual_keyboard_v1,
+    },
 };
 
-use futures::{StreamExt, channel::mpsc};
+use futures::{FutureExt, future::LocalBoxFuture};
 
-use crate::{actions::ActionCallback, event::IcedLayerEvent, proxy::IcedProxy, settings::Settings};
+use crate::{proxy::IcedProxy, settings::Settings};
 
 /// An interactive, native cross-platform application.
 ///
@@ -129,7 +140,6 @@ where
     A::Theme: DefaultStyle,
     A::Message: 'static + TryInto<LayershellCustomActions, Error = A::Message>,
 {
-    use futures::Future;
     use futures::task;
 
     let mut debug = Debug::new();
@@ -180,24 +190,19 @@ where
 
     let state = State::new(&application, &ev);
 
-    let (mut event_sender, event_receiver) =
-        mpsc::unbounded::<IcedLayerEvent<Action<A::Message>>>();
-    let (control_sender, mut control_receiver) = mpsc::unbounded::<LayerShellActionVec>();
-
-    let mut instance = Box::pin(run_instance::<A, E, C>(
+    let context = Context::<A, E, C>::new(
         application,
         compositor_settings,
         runtime,
-        debug,
-        event_receiver,
-        control_sender,
         state,
         window,
+        debug,
         settings.fonts,
-    ));
+    );
+    let mut context_state = ContextState::Context(context);
 
-    let mut context = task::Context::from_waker(task::noop_waker_ref());
-    let mut wl_input_region: Option<WlRegion> = None;
+    let mut waiting_layer_shell_events = VecDeque::new();
+    let mut task_context = task::Context::from_waker(task::noop_waker_ref());
 
     let _ = ev.running_with_proxy(message_receiver, move |event, ev, _| {
         let mut def_returndata = ReturnData::None;
@@ -209,7 +214,9 @@ where
                 let wl_compositor = globals
                     .bind::<WlCompositor, _, _>(qh, 1..=1, ())
                     .expect("could not bind wl_compositor");
-                wl_input_region = Some(wl_compositor.create_region(qh, ()));
+                waiting_layer_shell_events.push_back(WaitingLayerShellEvent::UpdateInputRegion(
+                    wl_compositor.create_region(qh, ()),
+                ));
 
                 if settings.virtual_keyboard_support.is_some() {
                     let virtual_keyboard_manager = globals
@@ -232,107 +239,50 @@ where
                 }
             }
             LayerEvent::RequestMessages(message) => {
-                event_sender
-                    .start_send(message.into())
-                    .expect("Cannot send");
-            }
-            LayerEvent::NormalDispatch => {
-                event_sender
-                    .start_send(IcedLayerEvent::NormalUpdate)
-                    .expect("Cannot send");
+                waiting_layer_shell_events.push_back(WaitingLayerShellEvent::Window(
+                    LayerWindowEvent::from(message),
+                ));
             }
             LayerEvent::UserEvent(event) => {
-                event_sender
-                    .start_send(IcedLayerEvent::UserEvent(event))
-                    .ok();
+                waiting_layer_shell_events.push_back(WaitingLayerShellEvent::UserAction(event));
             }
-            LayerEvent::WindowClosed => {
-                event_sender
-                    // there is only one window, id doesn't matter.
-                    .start_send(IcedLayerEvent::WindowRemoved(IcedCoreWindow::Id::unique()))
-                    .expect("Cannot send");
+            LayerEvent::NormalDispatch => {
+                waiting_layer_shell_events.push_back(WaitingLayerShellEvent::NormalDispatch);
             }
             _ => {}
         }
-        let poll = instance.as_mut().poll(&mut context);
-
-        let task::Poll::Pending = poll else {
-            return ReturnData::RequestExit;
-        };
-
-        let Ok(Some(flows)) = control_receiver.try_next() else {
-            return def_returndata;
-        };
-        for flow in flows {
-            match flow {
-                LayerShellAction::CustomActions(action) => match action {
-                    LayershellCustomActions::AnchorChange(anchor) => {
-                        ev.main_window().set_anchor(anchor);
+        loop {
+            let mut need_continue = false;
+            context_state = match std::mem::replace(&mut context_state, ContextState::None) {
+                ContextState::None => unreachable!("context state is taken but not returned"),
+                ContextState::Future(mut future) => {
+                    tracing::debug!("poll context future");
+                    match future.as_mut().poll(&mut task_context) {
+                        Poll::Ready(context) => {
+                            tracing::debug!("context future is ready");
+                            // context is ready, continue to run.
+                            need_continue = true;
+                            ContextState::Context(context)
+                        }
+                        Poll::Pending => ContextState::Future(future),
                     }
-                    LayershellCustomActions::AnchorSizeChange(anchor, size) => {
-                        ev.main_window().set_anchor_with_size(anchor, size);
-                    }
-                    LayershellCustomActions::LayerChange(layer) => {
-                        ev.main_window().set_layer(layer);
-                    }
-                    LayershellCustomActions::SetInputRegion(ActionCallback(set_region)) => {
-                        let window = ev.main_window();
-
-                        let region = wl_input_region.as_ref().expect("region not found");
-                        let window_size = window.get_size();
-                        let width: i32 = window_size.0.try_into().unwrap_or_default();
-                        let height: i32 = window_size.1.try_into().unwrap_or_default();
-
-                        region.subtract(0, 0, width, height);
-                        set_region(region);
-
-                        window.get_wlsurface().set_input_region(Some(region));
-                    }
-                    LayershellCustomActions::MarginChange(margin) => {
-                        ev.main_window().set_margin(margin);
-                    }
-                    LayershellCustomActions::SizeChange((width, height)) => {
-                        ev.main_window().set_size((width, height));
-                    }
-                    LayershellCustomActions::ExclusiveZoneChange(zone_size) => {
-                        ev.main_window().set_exclusive_zone(zone_size);
-                    }
-                    LayershellCustomActions::VirtualKeyboardPressed { time, key } => {
-                        use layershellev::reexport::wayland_client::KeyState;
-                        let ky = ev.get_virtual_keyboard().unwrap();
-                        ky.key(time, key, KeyState::Pressed.into());
-
-                        let eh = ev.get_loop_handler().unwrap();
-                        eh.insert_source(
-                            Timer::from_duration(Duration::from_micros(100)),
-                            move |_, _, state| {
-                                let ky = state.get_virtual_keyboard().unwrap();
-
-                                ky.key(time, key, KeyState::Released.into());
-                                TimeoutAction::Drop
-                            },
-                        )
-                        .ok();
-                    }
-                    _ => {}
-                },
-                LayerShellAction::Mouse(mouse) => {
-                    let Some(pointer) = ev.get_pointer() else {
-                        return ReturnData::None;
-                    };
-
-                    ev.append_return_data(ReturnData::RequestSetCursorShape((
-                        conversion::mouse_interaction(mouse),
-                        pointer.clone(),
-                    )));
                 }
-                LayerShellAction::RedrawAll => {
-                    ev.request_refresh_all();
+                ContextState::Context(context) => {
+                    if let Some(layer_shell_event) = waiting_layer_shell_events.pop_front() {
+                        need_continue = true;
+                        let (context_state, waiting_layer_shell_event) =
+                            context.handle_event(ev, layer_shell_event);
+                        if let Some(waiting_layer_shell_event) = waiting_layer_shell_event {
+                            waiting_layer_shell_events.push_front(waiting_layer_shell_event);
+                        }
+                        context_state
+                    } else {
+                        ContextState::Context(context)
+                    }
                 }
-                LayerShellAction::RedrawWindow(index) => {
-                    ev.request_refresh(index);
-                }
-                _ => {}
+            };
+            if !need_continue {
+                break;
             }
         }
         def_returndata
@@ -340,271 +290,447 @@ where
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_instance<A, E, C>(
-    mut application: A,
-    compositor_settings: iced_graphics::Settings,
-    mut runtime: SingleRuntime<E, A::Message>,
-    mut debug: Debug,
-    mut event_receiver: mpsc::UnboundedReceiver<IcedLayerEvent<Action<A::Message>>>,
-    mut control_sender: mpsc::UnboundedSender<LayerShellActionVec>,
-    mut state: State<A>,
-    window: Arc<WindowWrapper>,
-    fonts: Vec<Cow<'static, [u8]>>,
-) where
+enum ContextState<Context> {
+    None,
+    Context(Context),
+    Future(LocalBoxFuture<'static, Context>),
+}
+
+struct Context<A, E, C>
+where
     A: Application + 'static,
-    E: Executor + 'static,
     C: Compositor<Renderer = A::Renderer> + 'static,
+    E: Executor + 'static,
+    A::Theme: DefaultStyle,
+    A::Message: 'static,
+{
+    iced_id: IcedId,
+    compositor_settings: iced_graphics::Settings,
+    runtime: SingleRuntime<E, A::Message>,
+    state: State<A>,
+    layer_shell_window_wrapper: Arc<WindowWrapper>,
+    mouse_interaction: Interaction,
+    debug: Debug,
+    fonts: Vec<Cow<'static, [u8]>>,
+    compositor_context: Option<(C, C::Surface, A::Renderer)>,
+    clipboard: LayerShellClipboard,
+    wl_input_region: Option<WlRegion>,
+    user_interface: UserInterface<A, A::Message, A::Theme, A::Renderer>,
+    waiting_layer_shell_actions: Vec<LayershellCustomActions>,
+    iced_events: Vec<IcedEvent>,
+    messages: Vec<A::Message>,
+}
+
+impl<A, E, C> Context<A, E, C>
+where
+    A: Application + 'static,
+    C: Compositor<Renderer = A::Renderer> + 'static,
+    E: Executor + 'static,
     A::Theme: DefaultStyle,
     A::Message: 'static + TryInto<LayershellCustomActions, Error = A::Message>,
 {
-    use iced_core::Event;
-    use iced_core::mouse;
-
-    let mut compositor = C::new(compositor_settings, window.clone())
-        .await
-        .expect("Cannot create compositor");
-    for font in fonts {
-        compositor.load_font(font);
-    }
-
-    let mut renderer = compositor.create_renderer();
-
-    let cache = user_interface::Cache::default();
-
-    // HACK: the surface size should not be set as 0, 0
-    // but it will changed later
-    // so here set it to 1, 1
-    let mut surface = compositor.create_surface(window.clone(), 1, 1);
-
-    let mut should_exit = false;
-
-    let mut clipboard = LayerShellClipboard::connect(&window);
-
-    let mut mouse_interaction = mouse::Interaction::default();
-    let mut messages = Vec::new();
-    let mut events: Vec<Event> = Vec::new();
-    let mut custom_actions = Vec::new();
-
-    let mut user_interface = ManuallyDrop::new(build_user_interface(
-        &application,
-        cache,
-        &mut renderer,
-        state.viewport().logical_size(),
-        &mut debug,
-    ));
-
-    debug.startup_finished();
-
-    let main_id = IcedCoreWindow::Id::unique();
-    let mut p_width: u32 = 0;
-    let mut p_height: u32 = 0;
-    let mut p_fractal_scale: f64 = 0.;
-
-    while let Some(event) = event_receiver.next().await {
-        match event {
-            IcedLayerEvent::RequestRefresh {
-                width,
-                height,
-                fractal_scale,
-            } => {
-                if p_width != width || p_height != height || p_fractal_scale != fractal_scale {
-                    p_width = width;
-                    p_height = height;
-                    p_fractal_scale = fractal_scale;
-
-                    state.update_view_port(width, height, fractal_scale);
-
-                    debug.layout_started();
-                    user_interface = ManuallyDrop::new(
-                        ManuallyDrop::into_inner(user_interface)
-                            .relayout(state.viewport().logical_size(), &mut renderer),
-                    );
-                    debug.layout_finished();
-
-                    let physical_size = state.viewport().physical_size();
-                    compositor.configure_surface(
-                        &mut surface,
-                        physical_size.width,
-                        physical_size.height,
-                    );
-                }
-
-                let redraw_event =
-                    IcedCoreEvent::Window(IcedCoreWindow::Event::RedrawRequested(Instant::now()));
-
-                user_interface.update(
-                    &[redraw_event.clone()],
-                    state.cursor(),
-                    &mut renderer,
-                    &mut clipboard,
-                    &mut messages,
-                );
-                events.push(redraw_event.clone());
-                runtime.broadcast(iced_futures::subscription::Event::Interaction {
-                    window: main_id,
-                    event: redraw_event,
-                    status: iced_core::event::Status::Ignored,
-                });
-
-                debug.draw_started();
-                let new_mouse_interaction = user_interface.draw(
-                    &mut renderer,
-                    state.theme(),
-                    &iced_core::renderer::Style {
-                        text_color: state.text_color(),
-                    },
-                    state.cursor(),
-                );
-                debug.draw_finished();
-
-                if new_mouse_interaction != mouse_interaction {
-                    custom_actions.push(LayerShellAction::Mouse(new_mouse_interaction));
-                    mouse_interaction = new_mouse_interaction;
-                }
-                // TODO: check mouse_interaction
-
-                debug.render_started();
-
-                match compositor.present(
-                    &mut renderer,
-                    &mut surface,
-                    state.viewport(),
-                    state.background_color(),
-                    &debug.overlay(),
-                ) {
-                    Ok(()) => {
-                        debug.render_finished();
-                    }
-                    Err(error) => match error {
-                        compositor::SurfaceError::OutOfMemory => {
-                            panic!("{:?}", error);
-                        }
-                        _ => {
-                            debug.render_finished();
-                            tracing::error!(
-                                "Error {error:?} when \
-                                        presenting surface."
-                            );
-                        }
-                    },
-                }
-            }
-            IcedLayerEvent::Window(event) => {
-                state.update(&event);
-
-                if let Some(event) = conversion::window_event(
-                    &event,
-                    state.application_scale_factor(),
-                    state.modifiers(),
-                ) {
-                    events.push(event);
-                }
-            }
-            IcedLayerEvent::UserEvent(event) => {
-                let mut cache = ManuallyDrop::into_inner(user_interface).into_cache();
-                run_action(
-                    &application,
-                    &mut compositor,
-                    &mut surface,
-                    &mut cache,
-                    &state,
-                    &mut renderer,
-                    event,
-                    &mut messages,
-                    &mut clipboard,
-                    &mut custom_actions,
-                    &mut should_exit,
-                    &mut debug,
-                );
-                user_interface = ManuallyDrop::new(build_user_interface(
-                    &application,
-                    cache,
-                    &mut renderer,
-                    state.viewport().logical_size(),
-                    &mut debug,
-                ));
-                if should_exit {
-                    break;
-                }
-            }
-            IcedLayerEvent::NormalUpdate => {
-                if events.is_empty() && messages.is_empty() {
-                    continue;
-                }
-                debug.event_processing_started();
-                let (interface_state, statuses) = user_interface.update(
-                    &events,
-                    state.cursor(),
-                    &mut renderer,
-                    &mut clipboard,
-                    &mut messages,
-                );
-                debug.event_processing_finished();
-
-                for (event, status) in events.drain(..).zip(statuses.into_iter()) {
-                    runtime.broadcast(iced_futures::subscription::Event::Interaction {
-                        window: main_id,
-                        event,
-                        status,
-                    });
-                }
-
-                if !messages.is_empty()
-                    || matches!(interface_state, user_interface::State::Outdated)
-                {
-                    let cache = ManuallyDrop::into_inner(user_interface).into_cache();
-                    // Update application
-                    update(
-                        &mut application,
-                        &mut state,
-                        &mut runtime,
-                        &mut debug,
-                        &mut messages,
-                    );
-                    user_interface = ManuallyDrop::new(build_user_interface(
-                        &application,
-                        cache,
-                        &mut renderer,
-                        state.viewport().logical_size(),
-                        &mut debug,
-                    ));
-                }
-                custom_actions.push(LayerShellAction::RedrawAll);
-            }
-            IcedLayerEvent::WindowRemoved(_) => {
-                should_exit = true;
-            }
-            _ => unreachable!(),
+    pub fn new(
+        application: A,
+        compositor_settings: iced_graphics::Settings,
+        runtime: SingleRuntime<E, A::Message>,
+        state: State<A>,
+        layer_shell_window_wrapper: Arc<WindowWrapper>,
+        debug: Debug,
+        fonts: Vec<Cow<'static, [u8]>>,
+    ) -> Self {
+        Self {
+            iced_id: IcedId::unique(),
+            compositor_settings,
+            runtime,
+            state,
+            layer_shell_window_wrapper,
+            mouse_interaction: Default::default(),
+            debug,
+            fonts,
+            compositor_context: Default::default(),
+            clipboard: LayerShellClipboard::unconnected(),
+            wl_input_region: Default::default(),
+            user_interface: UserInterface::new(application),
+            waiting_layer_shell_actions: Default::default(),
+            iced_events: Default::default(),
+            messages: Default::default(),
         }
-        let mut copyactions = vec![];
-        std::mem::swap(&mut copyactions, &mut custom_actions);
-        control_sender.start_send(copyactions).ok();
     }
 
-    drop(ManuallyDrop::into_inner(user_interface));
-}
+    async fn create_compositor_context(mut self) -> Self {
+        let mut new_compositor = C::new(
+            self.compositor_settings,
+            self.layer_shell_window_wrapper.clone(),
+        )
+        .await
+        .expect("Cannot create compositer");
+        for font in self.fonts.clone() {
+            new_compositor.load_font(font);
+        }
 
-/// Builds a [`UserInterface`] for the provided [`Application`], logging
-/// [`struct@Debug`] information accordingly.
-pub fn build_user_interface<'a, A: Application>(
-    application: &'a A,
-    cache: user_interface::Cache,
-    renderer: &mut A::Renderer,
-    size: Size,
-    debug: &mut Debug,
-) -> UserInterface<'a, A::Message, A::Theme, A::Renderer>
-where
-    A::Theme: DefaultStyle,
-{
-    debug.view_started();
-    let view = application.view();
-    debug.view_finished();
+        let renderer = new_compositor.create_renderer();
+        // HACK: the surface size should not be set as 0, 0
+        // but it will changed later
+        // so here set it to 1, 1
+        let surface = new_compositor.create_surface(self.layer_shell_window_wrapper.clone(), 1, 1);
+        self.compositor_context = Some((new_compositor, surface, renderer));
 
-    debug.layout_started();
-    let user_interface = UserInterface::build(view, size, cache, renderer);
-    debug.layout_finished();
-    user_interface
+        self.clipboard = LayerShellClipboard::connect(&self.layer_shell_window_wrapper);
+        self
+    }
+
+    fn handle_event(
+        mut self,
+        ev: &mut WindowStateSimple,
+        layer_shell_event: WaitingLayerShellEvent<A::Message>,
+    ) -> (
+        ContextState<Self>,
+        Option<WaitingLayerShellEvent<A::Message>>,
+    ) {
+        tracing::debug!(
+            "Handle layer shell event, event: {:?}, waiting actions: {}, messages: {}",
+            layer_shell_event,
+            self.waiting_layer_shell_actions.len(),
+            self.messages.len(),
+        );
+        if self.compositor_context.is_none() {
+            tracing::debug!("creating compositor");
+            let context_state =
+                ContextState::Future(self.create_compositor_context().boxed_local());
+            return (context_state, Some(layer_shell_event));
+        }
+
+        match layer_shell_event {
+            WaitingLayerShellEvent::UpdateInputRegion(region) => {
+                self.wl_input_region = Some(region)
+            }
+            WaitingLayerShellEvent::Window(LayerWindowEvent::Refresh) => {
+                self.handle_refresh_event(ev)
+            }
+            WaitingLayerShellEvent::Window(LayerWindowEvent::Closed) => {
+                ev.append_return_data(ReturnData::RequestExit)
+            }
+            WaitingLayerShellEvent::Window(window_event) => self.handle_window_event(window_event),
+            WaitingLayerShellEvent::UserAction(user_action) => {
+                self.handle_user_action(ev, user_action)
+            }
+            WaitingLayerShellEvent::NormalDispatch => self.handle_normal_dispatch(ev),
+        }
+
+        // at each interaction try to resolve those waiting actions.
+        let mut waiting_layer_shell_actions = Vec::new();
+        mem::swap(
+            &mut self.waiting_layer_shell_actions,
+            &mut waiting_layer_shell_actions,
+        );
+        for action in waiting_layer_shell_actions {
+            self.handle_layer_shell_action(ev, action);
+        }
+
+        (ContextState::Context(self), None)
+    }
+
+    fn handle_refresh_event(&mut self, ev: &mut WindowStateSimple) {
+        let (compositor, surface, renderer) = self
+            .compositor_context
+            .as_mut()
+            .expect("compositor context is not initialized");
+        let layer_shell_window = ev.main_window();
+        let (width, height) = layer_shell_window.get_size();
+        let scale_float = layer_shell_window.scale_float();
+        // events may not be handled after RequestRefreshWithWrapper in the same
+        // interaction, we dispatched them immediately.
+        let mut events = Vec::new();
+
+        if !self.user_interface.is_built() {
+            self.state.update_view_port(width, height, scale_float);
+
+            self.user_interface.build(
+                user_interface::Cache::default(),
+                renderer,
+                self.state.viewport().logical_size(),
+                &mut self.debug,
+            );
+
+            // update the size of the suface after created.
+            let physical_size = self.state.viewport().physical_size();
+            compositor.configure_surface(surface, physical_size.width, physical_size.height);
+
+            events.push(IcedEvent::Window(IcedWindowEvent::Opened {
+                position: None,
+                size: self.state.window_size_f32(),
+            }));
+        };
+
+        let mut ui = self.user_interface.ui_mut().expect("ui not built");
+
+        let window_size = self.state.window_size();
+
+        if window_size.width != width
+            || window_size.height != height
+            || self.state.wayland_scale_factor() != scale_float
+        {
+            self.state.update_view_port(width, height, scale_float);
+            ui = ui.relayout(self.state.viewport().logical_size(), renderer);
+
+            let physical_size = self.state.viewport().physical_size();
+            compositor.configure_surface(surface, physical_size.width, physical_size.height);
+        }
+
+        let cursor = self.state.cursor();
+
+        events.push(IcedEvent::Window(IcedWindowEvent::RedrawRequested(
+            Instant::now(),
+        )));
+        let (_, statuses) = ui.update(
+            &events,
+            cursor,
+            renderer,
+            &mut self.clipboard,
+            &mut self.messages,
+        );
+
+        for (idx, event) in events.into_iter().enumerate() {
+            let status = statuses
+                .get(idx)
+                .cloned()
+                .unwrap_or(iced_core::event::Status::Ignored);
+            self.runtime
+                .broadcast(iced_futures::subscription::Event::Interaction {
+                    window: self.iced_id,
+                    event,
+                    status,
+                });
+        }
+        self.debug.render_started();
+
+        self.debug.draw_started();
+        let new_mouse_interaction = ui.draw(
+            renderer,
+            self.state.theme(),
+            &iced_core::renderer::Style {
+                text_color: self.state.text_color(),
+            },
+            cursor,
+        );
+        self.debug.draw_finished();
+
+        if new_mouse_interaction != self.mouse_interaction {
+            if let Some(pointer) = ev.get_pointer() {
+                ev.append_return_data(ReturnData::RequestSetCursorShape((
+                    conversion::mouse_interaction(new_mouse_interaction),
+                    pointer.clone(),
+                )));
+            }
+            self.mouse_interaction = new_mouse_interaction;
+        }
+
+        match compositor.present(
+            renderer,
+            surface,
+            self.state.viewport(),
+            self.state.background_color(),
+            &self.debug.overlay(),
+        ) {
+            Ok(()) => {
+                self.debug.render_finished();
+            }
+            Err(error) => match error {
+                compositor::SurfaceError::OutOfMemory => {
+                    panic!("{:?}", error);
+                }
+                _ => {
+                    // we can't reset the present available state here, the window will
+                    // will never be redrawn.
+                    panic!("Error {error:?} when presenting surface.");
+                }
+            },
+        }
+    }
+
+    fn handle_window_event(&mut self, event: LayerWindowEvent) {
+        self.state.update(&event);
+        if let Some(event) = conversion::window_event(
+            &event,
+            self.state.application_scale_factor(),
+            self.state.modifiers(),
+        ) {
+            self.iced_events.push(event);
+        }
+    }
+
+    fn handle_user_action(&mut self, ev: &mut WindowStateSimple, action: Action<A::Message>) {
+        let (compositor, surface, renderer) = self
+            .compositor_context
+            .as_mut()
+            .expect("compositor context is not initialized");
+        let mut should_exit = false;
+        run_action(
+            &mut self.user_interface,
+            compositor,
+            surface,
+            &self.state,
+            renderer,
+            action,
+            &mut self.messages,
+            &mut self.clipboard,
+            &mut self.waiting_layer_shell_actions,
+            &mut should_exit,
+            &mut self.debug,
+        );
+        if should_exit {
+            ev.append_return_data(ReturnData::RequestExit);
+        }
+    }
+
+    fn handle_layer_shell_action(
+        &mut self,
+        ev: &mut WindowStateSimple,
+        action: LayershellCustomActions,
+    ) {
+        match action {
+            LayershellCustomActions::AnchorChange(anchor) => {
+                ev.main_window().set_anchor(anchor);
+            }
+            LayershellCustomActions::AnchorSizeChange(anchor, size) => {
+                ev.main_window().set_anchor_with_size(anchor, size);
+            }
+            LayershellCustomActions::LayerChange(layer) => {
+                ev.main_window().set_layer(layer);
+            }
+            LayershellCustomActions::MarginChange(margin) => {
+                ev.main_window().set_margin(margin);
+            }
+            LayershellCustomActions::SizeChange((width, height)) => {
+                ev.main_window().set_size((width, height));
+            }
+            LayershellCustomActions::ExclusiveZoneChange(zone_size) => {
+                ev.main_window().set_exclusive_zone(zone_size);
+            }
+            LayershellCustomActions::SetInputRegion(set_region) => {
+                let layer_shell_window = ev.main_window();
+                let set_region = set_region.0;
+                let Some(region) = &self.wl_input_region else {
+                    tracing::warn!("wl_input_region is not set, ignore SetInputRegion",);
+                    return;
+                };
+
+                let window_size = layer_shell_window.get_size();
+                let width: i32 = window_size.0.try_into().unwrap_or_default();
+                let height: i32 = window_size.1.try_into().unwrap_or_default();
+
+                region.subtract(0, 0, width, height);
+                set_region(region);
+
+                layer_shell_window
+                    .get_wlsurface()
+                    .set_input_region(self.wl_input_region.as_ref());
+            }
+            LayershellCustomActions::VirtualKeyboardPressed { time, key } => {
+                use layershellev::reexport::wayland_client::KeyState;
+                let ky = ev.get_virtual_keyboard().unwrap();
+                ky.key(time, key, KeyState::Pressed.into());
+
+                let eh = ev.get_loop_handler().unwrap();
+                eh.insert_source(
+                    Timer::from_duration(Duration::from_micros(100)),
+                    move |_, _, state| {
+                        let ky = state.get_virtual_keyboard().unwrap();
+
+                        ky.key(time, key, KeyState::Released.into());
+                        TimeoutAction::Drop
+                    },
+                )
+                .ok();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_normal_dispatch(&mut self, ev: &mut WindowStateSimple) {
+        if self.iced_events.is_empty() && self.messages.is_empty() {
+            return;
+        }
+
+        let (_, _, renderer) = self
+            .compositor_context
+            .as_mut()
+            .expect("compositor context is not initialized");
+
+        self.debug.event_processing_started();
+
+        let (ui_state, statuses) = if let Some(mut ui) = self.user_interface.ui_mut() {
+            ui.update(
+                &self.iced_events,
+                self.state.cursor(),
+                renderer,
+                &mut self.clipboard,
+                &mut self.messages,
+            )
+        } else {
+            // ui hasn't been built skip
+            ev.request_refresh_all();
+            return;
+        };
+
+        let mut rebuilt = false;
+        match ui_state {
+            user_interface::State::Outdated => rebuilt = true,
+            // TODO support redraw at
+            user_interface::State::Updated {
+                redraw_request: Some(_),
+            } => {}
+            user_interface::State::Updated {
+                redraw_request: None,
+            } => {
+                // no redraw
+                // custom_actions.pop();
+
+                // redraw anyway. in iced 0.13.1, most widget doesn't set redraw
+                // request.
+            }
+        }
+
+        self.debug.event_processing_finished();
+
+        for (event, status) in self.iced_events.drain(..).zip(statuses.into_iter()) {
+            self.runtime
+                .broadcast(iced_futures::subscription::Event::Interaction {
+                    window: self.iced_id,
+                    event,
+                    status,
+                });
+        }
+
+        if !self.messages.is_empty() {
+            let (cache, application) = self.user_interface.extract();
+
+            // Update application
+            update(
+                application,
+                &mut self.state,
+                &mut self.runtime,
+                &mut self.debug,
+                &mut self.messages,
+            );
+
+            self.user_interface.build(
+                cache.unwrap_or_default(),
+                renderer,
+                self.state.viewport().logical_size(),
+                &mut self.debug,
+            );
+        } else if rebuilt {
+            let (cache, _) = self.user_interface.extract();
+            self.user_interface.build(
+                cache.unwrap_or_default(),
+                renderer,
+                self.state.viewport().logical_size(),
+                &mut self.debug,
+            );
+        }
+        ev.request_refresh_all();
+    }
 }
 
 /// Updates an [`Application`] by feeding it the provided messages, spawning any
@@ -641,20 +767,19 @@ pub(crate) fn update<A: Application, E: Executor>(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_action<A, C>(
-    application: &A,
+    user_interface: &mut UserInterface<A, A::Message, A::Theme, A::Renderer>,
     compositor: &mut C,
     surface: &mut C::Surface,
-    cache: &mut user_interface::Cache,
     state: &State<A>,
     renderer: &mut A::Renderer,
     event: Action<A::Message>,
     messages: &mut Vec<A::Message>,
     clipboard: &mut LayerShellClipboard,
-    custom_actions: &mut Vec<LayerShellAction>,
+    waiting_layer_shell_actions: &mut Vec<LayershellCustomActions>,
     should_exit: &mut bool,
     debug: &mut Debug,
 ) where
-    A: Application,
+    A: Application + 'static,
     C: Compositor<Renderer = A::Renderer> + 'static,
     A::Theme: DefaultStyle,
     A::Message: 'static + TryInto<LayershellCustomActions, Error = A::Message>,
@@ -666,7 +791,7 @@ pub(crate) fn run_action<A, C>(
     use iced_runtime::window::Action as WindowAction;
     match event {
         Action::Output(stream) => match stream.try_into() {
-            Ok(action) => custom_actions.push(LayerShellAction::CustomActions(action)),
+            Ok(action) => waiting_layer_shell_actions.push(action),
             Err(stream) => {
                 messages.push(stream);
             }
@@ -681,19 +806,12 @@ pub(crate) fn run_action<A, C>(
             }
         },
         Action::Widget(action) => {
-            let mut current_cache = std::mem::take(cache);
             let mut current_operation = Some(action);
 
-            let mut user_interface = build_user_interface(
-                application,
-                current_cache,
-                renderer,
-                state.viewport().logical_size(),
-                debug,
-            );
-
             while let Some(mut operation) = current_operation.take() {
-                user_interface.operate(renderer, operation.as_mut());
+                if let Some(mut ui) = user_interface.ui_mut() {
+                    ui.operate(renderer, operation.as_mut());
+                }
 
                 match operation.finish() {
                     operation::Outcome::None => {}
@@ -705,9 +823,6 @@ pub(crate) fn run_action<A, C>(
                     }
                 }
             }
-
-            current_cache = user_interface.into_cache();
-            *cache = current_cache;
         }
         Action::Window(action) => match action {
             WindowAction::Close(_) => {

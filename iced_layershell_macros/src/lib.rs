@@ -79,7 +79,7 @@ pub fn to_layer_message(attr: TokenStream2, input: TokenStream2) -> manyhow::Res
                             Self::NewPopUp { settings, id } => Ok(LayershellCustomActionsWithId::new(None, LayershellCustomActions::NewPopUp { settings, id })),
                             Self::NewMenu { settings, id } =>  Ok(LayershellCustomActionsWithId::new(None, LayershellCustomActions::NewMenu {settings, id })),
                             Self::NewInputPanel {settings, id } => Ok(LayershellCustomActionsWithId::new(None, LayershellCustomActions::NewInputPanel { settings, id })),
-                            Self::RemoveWindow(id) => Ok(LayershellCustomActionsWithId::new(None, LayershellCustomActions::RemoveWindow(id))),
+                            Self::RemoveWindow(id) => Ok(LayershellCustomActionsWithId::new(Some(id), LayershellCustomActions::RemoveWindow)),
                             Self::ForgetLastOutput => Ok(LayershellCustomActionsWithId::new(None, LayershellCustomActions::ForgetLastOutput)),
                             _ => Err(self)
                         }

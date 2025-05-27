@@ -207,7 +207,6 @@ use std::fmt::Formatter;
 use std::fmt::Result as FmtResult;
 use std::sync::Arc;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -327,6 +326,7 @@ impl ZxdgOutputInfo {
 
 #[derive(Debug)]
 enum Shell {
+    #[allow(clippy::enum_variant_names)]
     LayerShell(ZwlrLayerSurfaceV1),
     PopUp((XdgPopup, XdgSurface)),
     InputPanel(#[allow(unused)] ZwpInputPanelSurfaceV1),
@@ -2415,24 +2415,18 @@ impl<T: 'static> WindowState<T> {
 
         self.loop_handler = Some(event_loop.handle());
 
-        let to_exit = Arc::new(AtomicBool::new(false));
-
         let events: Arc<Mutex<Vec<Message>>> = Arc::new(Mutex::new(Vec::new()));
 
-        let to_exit2 = to_exit.clone();
-        let events_2 = events.clone();
-        let thread = std::thread::spawn(move || {
-            let to_exit = to_exit2;
-            let events = events_2;
-            let Some(message_receiver) = message_receiver else {
-                return;
-            };
-            for message in message_receiver.iter() {
-                if to_exit.load(Ordering::Relaxed) {
-                    break;
+        std::thread::spawn({
+            let events = events.clone();
+            move || {
+                let Some(message_receiver) = message_receiver else {
+                    return;
+                };
+                for message in message_receiver.iter() {
+                    let mut events_local = events.lock().unwrap();
+                    events_local.push(message);
                 }
-                let mut events_local = events.lock().unwrap();
-                events_local.push(message);
             }
         });
         'out: loop {
@@ -2443,9 +2437,9 @@ impl<T: 'static> WindowState<T> {
             for msg in messages.iter() {
                 match msg {
                     (index_info, DispatchMessageInner::XdgInfoChanged(change_type)) => {
-                        event_handler(
+                        self.handle_event(
+                            &mut event_handler,
                             LayerEvent::XdgInfoChanged(*change_type),
-                            &mut self,
                             *index_info,
                         );
                     }
@@ -2522,27 +2516,11 @@ impl<T: 'static> WindowState<T> {
                         let (index_message, msg) = msg;
 
                         let msg: DispatchMessage = msg.clone().into();
-                        match event_handler(
+                        self.handle_event(
+                            &mut event_handler,
                             LayerEvent::RequestMessages(&msg),
-                            &mut self,
                             *index_message,
-                        ) {
-                            ReturnData::RequestExit => {
-                                break 'out;
-                            }
-                            ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
-                                let Some(serial) = self.enter_serial else {
-                                    continue;
-                                };
-                                set_cursor_shape(
-                                    &cursor_update_context,
-                                    shape_name,
-                                    pointer,
-                                    serial,
-                                );
-                            }
-                            _ => {}
-                        }
+                        );
                     }
                 }
             }
@@ -2552,24 +2530,14 @@ impl<T: 'static> WindowState<T> {
             std::mem::swap(&mut *local_events, &mut swapped_events);
             drop(local_events);
             for event in swapped_events {
-                match event_handler(LayerEvent::UserEvent(event), &mut self, None) {
-                    ReturnData::RequestExit => {
-                        break 'out;
-                    }
-                    ReturnData::RequestSetCursorShape((shape_name, pointer)) => {
-                        let Some(serial) = self.enter_serial else {
-                            continue;
-                        };
-                        set_cursor_shape(&cursor_update_context, shape_name, pointer, serial);
-                    }
-                    _ => {}
-                }
+                self.handle_event(&mut event_handler, LayerEvent::UserEvent(event), None);
             }
-            let mut return_data = vec![event_handler(LayerEvent::NormalDispatch, &mut self, None)];
-            loop {
-                return_data.append(&mut self.return_data);
 
-                let mut replace_data = Vec::new();
+            self.handle_event(&mut event_handler, LayerEvent::NormalDispatch, None);
+            loop {
+                let mut return_data = vec![];
+                std::mem::swap(&mut self.return_data, &mut return_data);
+
                 for data in return_data {
                     match data {
                         ReturnData::RequestExit => {
@@ -2816,11 +2784,9 @@ impl<T: 'static> WindowState<T> {
                         _ => {}
                     }
                 }
-                replace_data.retain(|x| !matches!(x, ReturnData::None));
-                if replace_data.is_empty() {
+                if self.return_data.is_empty() {
                     break;
                 }
-                return_data = replace_data;
             }
 
             let to_be_closed_ids: Vec<_> = self
@@ -2830,7 +2796,11 @@ impl<T: 'static> WindowState<T> {
                 .map(WindowStateUnit::id)
                 .collect();
             for id in to_be_closed_ids {
-                event_handler(LayerEvent::WindowClosed, &mut self, Some(id));
+                self.handle_event(
+                    &mut event_handler,
+                    LayerEvent::RequestMessages(&DispatchMessage::Closed),
+                    Some(id),
+                );
                 // event_handler may use unit, only remove it after calling event_handler.
                 self.remove_shell(id);
             }
@@ -2867,27 +2837,40 @@ impl<T: 'static> WindowState<T> {
                         self.units[idx].buffer = Some(buffer);
                     }
                     self.request_next_present(unit_id);
-                    event_handler(
+                    self.handle_event(
+                        &mut event_handler,
                         LayerEvent::RequestMessages(&DispatchMessage::RequestRefresh {
                             width,
                             height,
                             is_created,
                             scale_float,
                         }),
-                        &mut self,
                         Some(unit_id),
                     );
                 }
             }
         }
-        to_exit.store(true, Ordering::Relaxed);
-        let _ = thread.join();
         Ok(())
     }
 
     pub fn request_next_present(&mut self, id: id::Id) {
         self.get_mut_unit_with_id(id)
             .map(WindowStateUnit::request_next_present);
+    }
+
+    pub fn handle_event<F, Message>(
+        &mut self,
+        mut event_handler: F,
+        event: LayerEvent<T, Message>,
+        unit_id: Option<id::Id>,
+    ) where
+        Message: std::marker::Send + 'static,
+        F: FnMut(LayerEvent<T, Message>, &mut WindowState<T>, Option<id::Id>) -> ReturnData<T>,
+    {
+        let return_data = event_handler(event, self, unit_id);
+        if !matches!(return_data, ReturnData::None) {
+            self.append_return_data(return_data);
+        }
     }
 }
 

@@ -57,7 +57,7 @@ enum Message {
     Close(Id),
     TextInput(String),
     Direction(WindowDirection),
-    IcedEvent(Event),
+    IcedEvent((Id, Event)),
 }
 
 impl Counter {
@@ -98,17 +98,17 @@ impl MultiApplication for Counter {
     }
 
     fn subscription(&self) -> iced::Subscription<Self::Message> {
-        event::listen().map(Message::IcedEvent)
-    }
-    fn remove_id(&mut self, id: iced::window::Id) {
-        self.ids.remove(&id);
+        event::listen_with(|event, status, id| match status {
+            event::Status::Ignored => Some(Message::IcedEvent((id, event))),
+            event::Status::Captured => None,
+        })
     }
     fn update(&mut self, message: Message) -> Command<Message> {
         use iced::Event;
         use iced::keyboard;
         use iced::keyboard::key::Named;
         match message {
-            Message::IcedEvent(event) => {
+            Message::IcedEvent((id, event)) => {
                 match event {
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(Named::Escape),
@@ -130,6 +130,9 @@ impl MultiApplication for Counter {
                             },
                             id,
                         });
+                    }
+                    Event::Window(iced::window::Event::Closed) => {
+                        self.ids.remove(&id);
                     }
                     _ => {}
                 }

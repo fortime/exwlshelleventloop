@@ -19,24 +19,19 @@ fn main() -> iced_layershell::Result {
         .with(fmt::layer())
         .with(EnvFilter::from_default_env())
         .init();
-    build_pattern::daemon(
-        "multi_window",
-        Example::update,
-        Example::view,
-        Example::remove_id,
-    )
-    .theme(Example::theme)
-    .style(Example::style)
-    .subscription(Example::subscription)
-    .scale_factor(Example::scale_factor)
-    .settings(MainSettings {
-        layer_settings: LayerShellSettings {
-            start_mode: StartMode::Background,
+    build_pattern::daemon("multi_window", Example::update, Example::view)
+        .theme(Example::theme)
+        .style(Example::style)
+        .subscription(Example::subscription)
+        .scale_factor(Example::scale_factor)
+        .settings(MainSettings {
+            layer_settings: LayerShellSettings {
+                start_mode: StartMode::Background,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    })
-    .run_with(Example::new)?;
+        })
+        .run_with(Example::new)?;
     Ok(())
 }
 
@@ -204,10 +199,6 @@ impl Example {
                 None
             }
         })
-    }
-
-    fn remove_id(&mut self, _window: window::Id) {
-        // self.windows.remove(&window);
     }
 }
 

@@ -14,24 +14,19 @@ use iced_layershell::to_layer_message;
 
 pub fn main() -> Result<(), iced_layershell::Error> {
     tracing_subscriber::fmt().init();
-    daemon(
-        Counter::namespace,
-        Counter::update,
-        Counter::view,
-        Counter::remove_id,
-    )
-    .subscription(Counter::subscription)
-    .settings(MainSettings {
-        layer_settings: LayerShellSettings {
-            size: Some((0, 400)),
-            exclusive_zone: 400,
-            anchor: Anchor::Bottom | Anchor::Left | Anchor::Right,
-            start_mode: StartMode::AllScreens,
+    daemon(Counter::namespace, Counter::update, Counter::view)
+        .subscription(Counter::subscription)
+        .settings(MainSettings {
+            layer_settings: LayerShellSettings {
+                size: Some((0, 400)),
+                exclusive_zone: 400,
+                anchor: Anchor::Bottom | Anchor::Left | Anchor::Right,
+                start_mode: StartMode::AllScreens,
+                ..Default::default()
+            },
             ..Default::default()
-        },
-        ..Default::default()
-    })
-    .run_with(|| Counter::new("Hello"))
+        })
+        .run_with(|| Counter::new("Hello"))
 }
 
 #[derive(Debug, Default)]
@@ -66,7 +61,7 @@ enum Message {
     Close(Id),
     TextInput(String),
     Direction(WindowDirection),
-    IcedEvent(Event),
+    IcedEvent((Id, Event)),
 }
 
 impl Counter {
@@ -96,16 +91,15 @@ impl Counter {
         self.ids.get(&id).cloned()
     }
 
-    fn remove_id(&mut self, id: iced::window::Id) {
-        self.ids.remove(&id);
-    }
-
     fn namespace(&self) -> String {
         String::from("Counter - Iced")
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        event::listen().map(Message::IcedEvent)
+        event::listen_with(|event, status, id| match status {
+            event::Status::Ignored => Some(Message::IcedEvent((id, event))),
+            event::Status::Captured => None,
+        })
     }
 
     fn update(&mut self, message: Message) -> Command<Message> {
@@ -113,7 +107,7 @@ impl Counter {
         use iced::keyboard;
         use iced::keyboard::key::Named;
         match message {
-            Message::IcedEvent(event) => {
+            Message::IcedEvent((id, event)) => {
                 match event {
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Named(Named::Escape),
@@ -135,6 +129,9 @@ impl Counter {
                             },
                             id,
                         });
+                    }
+                    Event::Window(iced::window::Event::Closed) => {
+                        self.ids.remove(&id);
                     }
                     _ => {}
                 }
