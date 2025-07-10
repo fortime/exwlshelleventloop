@@ -113,6 +113,7 @@
 pub use events::NewInputPanelSettings;
 pub use events::NewLayerShellSettings;
 pub use events::NewPopUpSettings;
+pub use events::OutputOption;
 pub use waycrate_xkbkeycode::keyboard;
 pub use waycrate_xkbkeycode::xkb_keyboard;
 
@@ -2557,24 +2558,31 @@ impl<T: 'static> WindowState<T> {
                                 exclusive_zone,
                                 margin,
                                 keyboard_interactivity,
-                                use_last_output,
+                                output_option,
                                 events_transparent,
                             },
                             id,
                             info,
                         )) => {
-                            let pos = self.surface_pos();
+                            let mut output = match &output_option {
+                                events::OutputOption::LastOutput => {
+                                    if self.last_wloutput.is_none()
+                                        && self.outputs.len() > self.last_unit_index
+                                    {
+                                        self.last_wloutput =
+                                            Some(self.outputs[self.last_unit_index].1.clone());
+                                    }
+                                    None
+                                }
+                                events::OutputOption::Output(wl_output) => Some(wl_output),
+                                events::OutputOption::None => self
+                                    .surface_pos()
+                                    .and_then(|p| self.units[p].wl_output.as_ref()),
+                            };
 
-                            let mut output = pos.and_then(|p| self.units[p].wl_output.as_ref());
-
-                            if self.last_wloutput.is_none()
-                                && self.outputs.len() > self.last_unit_index
-                            {
-                                self.last_wloutput =
-                                    Some(self.outputs[self.last_unit_index].1.clone());
-                            }
-
-                            if use_last_output {
+                            if self.last_wloutput.is_none() && output.is_some() {
+                                self.last_wloutput = output.cloned();
+                            } else if output.is_none() {
                                 output = self.last_wloutput.as_ref();
                             }
 
@@ -2707,28 +2715,31 @@ impl<T: 'static> WindowState<T> {
                             NewInputPanelSettings {
                                 size: (width, height),
                                 keyboard,
-                                use_last_output,
+                                output_option,
                             },
                             id,
                             info,
                         )) => {
-                            let pos = self.surface_pos();
+                            let mut output = match &output_option {
+                                events::OutputOption::LastOutput => {
+                                    if self.last_wloutput.is_none()
+                                        && self.outputs.len() > self.last_unit_index
+                                    {
+                                        self.last_wloutput =
+                                            Some(self.outputs[self.last_unit_index].1.clone());
+                                    }
+                                    None
+                                }
+                                events::OutputOption::Output(wl_output) => Some(wl_output),
+                                events::OutputOption::None => self
+                                    .surface_pos()
+                                    .and_then(|p| self.units[p].wl_output.as_ref()),
+                            };
 
-                            let mut output = pos.and_then(|p| self.units[p].wl_output.as_ref());
-
-                            if self.last_wloutput.is_none()
-                                && self.outputs.len() > self.last_unit_index
-                            {
-                                self.last_wloutput =
-                                    Some(self.outputs[self.last_unit_index].1.clone());
-                            }
-
-                            if use_last_output {
+                            if self.last_wloutput.is_none() && output.is_some() {
+                                self.last_wloutput = output.cloned();
+                            } else if output.is_none() {
                                 output = self.last_wloutput.as_ref();
-                            }
-
-                            if output.is_none() {
-                                output = self.outputs.first().map(|(_, o)| o);
                             }
 
                             let Some(output) = output else {

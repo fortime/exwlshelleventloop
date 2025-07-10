@@ -85,7 +85,6 @@ impl Example {
                     layer: Layer::Top,
                     margin: None,
                     //keyboard_interactivity: KeyboardInteractivity::None,
-                    use_last_output: false,
                     ..Default::default()
                 },
                 id,

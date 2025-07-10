@@ -119,7 +119,6 @@ impl MultiApplication for Counter {
                         layer: Layer::Top,
                         margin: Some((100, 100, 100, 100)),
                         keyboard_interactivity: KeyboardInteractivity::OnDemand,
-                        use_last_output: false,
                         ..Default::default()
                     },
                     id: iced::window::Id::unique(),

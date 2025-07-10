@@ -9,7 +9,7 @@ use wayland_client::{
     protocol::{
         wl_buffer::WlBuffer,
         wl_compositor::WlCompositor,
-        wl_output::WlOutput,
+        wl_output::{self, WlOutput},
         wl_pointer::{self, ButtonState, WlPointer},
         wl_shm::WlShm,
     },
@@ -70,8 +70,24 @@ pub enum LayerEvent<'a, T, Message> {
     WindowClosed,
 }
 
+/// Define the output for new layershell
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum OutputOption {
+    /// follow the last output of the activated surface, used to create some thing like mako, who
+    /// will show on the same window, only when the notifications is cleared, it will change the
+    /// wl_output.
+    LastOutput,
+
+    /// NOTE: The output should be in the same connection with the layershellev, that means if you
+    /// want to pass a [wl_output::WlOutput] to create a new layershell, you need to pass your
+    /// connection to layershellev first
+    Output(wl_output::WlOutput),
+    #[default]
+    None,
+}
+
 /// layershell settings to create a new layershell surface
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewLayerShellSettings {
     /// the size of the layershell, optional.
     pub size: Option<(u32, u32)>,
@@ -80,10 +96,7 @@ pub struct NewLayerShellSettings {
     pub exclusive_zone: Option<i32>,
     pub margin: Option<(i32, i32, i32, i32)>,
     pub keyboard_interactivity: KeyboardInteractivity,
-    /// follow the last output of the activated surface, used to create some thing like mako, who
-    /// will show on the same window, only when the notifications is cleared, it will change the
-    /// wl_output.
-    pub use_last_output: bool,
+    pub output_option: OutputOption,
     pub events_transparent: bool,
 }
 
@@ -99,15 +112,12 @@ pub struct NewPopUpSettings {
 }
 
 /// input panel settings to create a new input panel surface
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInputPanelSettings {
     pub size: (u32, u32),
     /// set the surface type as a keyboard
     pub keyboard: bool,
-    /// follow the last output of the activated surface, used to create some thing like mako, who
-    /// will show on the same window, only when the notifications is cleared, it will change the
-    /// wl_output.
-    pub use_last_output: bool,
+    pub output_option: OutputOption,
 }
 
 impl Default for NewLayerShellSettings {
@@ -119,7 +129,7 @@ impl Default for NewLayerShellSettings {
             size: None,
             margin: Some((0, 0, 0, 0)),
             keyboard_interactivity: KeyboardInteractivity::OnDemand,
-            use_last_output: false,
+            output_option: Default::default(),
             events_transparent: false,
         }
     }
